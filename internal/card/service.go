@@ -1,14 +1,13 @@
 package card
 
 import (
+	"btc-giftcard/internal/database"
 	"btc-giftcard/internal/lnd"
 	messages "btc-giftcard/internal/queue"
 	"btc-giftcard/internal/wallet"
 	"btc-giftcard/pkg/cache"
-	streams "btc-giftcard/pkg/queue"
-
-	"btc-giftcard/internal/database"
 	"btc-giftcard/pkg/logger"
+	streams "btc-giftcard/pkg/queue"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -20,7 +19,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// Custom errors for card operations
+// ============================================================================
+// Errors
+// ============================================================================
+
 var (
 	ErrCardNotFound        = errors.New("card not found")
 	ErrCardNotActive       = errors.New("card is not active")
@@ -31,29 +33,45 @@ var (
 	ErrInvalidMethod       = errors.New("invalid redeem method")
 	ErrInvalidAddress      = errors.New("invalid bitcoin address")
 	ErrLightningInvoice    = errors.New("lightning invoice is required")
+	ErrInvalidCurrency     = errors.New("unsupported fiat currency")
+	ErrInvalidFiatAmount   = errors.New("fiat amount must be positive")
+	ErrInvalidPurchase     = errors.New("purchase price must be positive")
+	ErrMissingEmail        = errors.New("purchase email is required")
 )
 
-// Treasury cache and lock constants
+// ============================================================================
+// Constants
+// ============================================================================
+
 const (
+	// Treasury balance cache (Redis)
 	treasuryAvailableCacheKey = "treasury:available_sats"
 	treasuryAvailableCacheTTL = 10 * time.Second
-	treasuryLockKey           = "treasury:lock"
-	treasuryLockTTL           = 5 * time.Second
-)
 
-// On-chain redemption defaults
-const (
+	// Treasury distributed lock (Redis SETNX)
+	treasuryLockKey = "treasury:lock"
+	treasuryLockTTL = 5 * time.Second
+
+	// On-chain redemption defaults
 	defaultTargetConf    int32 = 6     // ~1 hour confirmation target
 	minOnChainAmountSats int64 = 10000 // 10k sats minimum (dust protection)
-)
 
-// Card-level lock for concurrent redemption protection
-const (
+	// Per-card lock for concurrent redemption protection
 	cardLockPrefix = "card:lock:"
 	cardLockTTL    = 10 * time.Second
 )
 
-// Service handles gift card business logic.
+// ============================================================================
+// Service — core type and constructor
+// ============================================================================
+
+// Service handles gift card business logic. It is the single source of truth
+// for the card lifecycle and is called by both API handlers and background workers.
+//
+// API handlers call: CreateCard, RedeemCard, GetCardByCode, GetCardBalance,
+// ValidateCardCode, GetTreasuryAvailableBalance.
+//
+// Workers call: FundCard (fund_card worker).
 type Service struct {
 	cardRepo  *database.CardRepository
 	txRepo    *database.TransactionRepository
@@ -79,113 +97,41 @@ func NewService(
 	}
 }
 
-// GetTreasuryAvailableBalance returns the available treasury balance (total LND
-// holdings minus reserved card balances). Results are cached in Redis for 10s
-// to avoid hitting LND (~50-100ms latency) on every call.
-func (s *Service) GetTreasuryAvailableBalance(ctx context.Context) (int64, error) {
-	// Try cache first
-	if cached, err := cache.Get(ctx, treasuryAvailableCacheKey); err == nil && cached != "" {
-		if val, parseErr := strconv.ParseInt(cached, 10, 64); parseErr == nil {
-			return val, nil
-		}
-		// Invalid cache value — fall through to recompute
-	}
+// ============================================================================
+// API methods — called by HTTP handlers
+// ============================================================================
 
-	// Compute from LND + DB
-	available, err := s.computeTreasuryBalance(ctx)
-	if err != nil {
-		return 0, err
-	}
+// --- Card lifecycle --------------------------------------------------------
 
-	// Cache the result (best-effort, don't fail on cache error)
-	if cacheErr := cache.Set(ctx, treasuryAvailableCacheKey, strconv.FormatInt(available, 10), treasuryAvailableCacheTTL); cacheErr != nil {
-		logger.Warn("failed to cache treasury balance", zap.Error(cacheErr))
-	}
+type CreateCardFiatCurrency string
 
-	return available, nil
-}
+const (
+	USD CreateCardFiatCurrency = "USD"
+	EUR CreateCardFiatCurrency = "EUR"
+)
 
-// computeTreasuryBalance fetches LND balances and DB reserved amounts
-// to calculate the available treasury balance without caching.
-func (s *Service) computeTreasuryBalance(ctx context.Context) (int64, error) {
-	channelBal, err := s.lndClient.GetChannelBalance(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get channel balance: %w", err)
-	}
-
-	walletBal, err := s.lndClient.GetWalletBalance(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get wallet balance: %w", err)
-	}
-
-	totalTreasury := channelBal.LocalSats + walletBal.ConfirmedSats
-
-	totalReserved, err := s.cardRepo.GetTotalReservedBalance(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch total reserved balance: %w", err)
-	}
-
-	available := totalTreasury - totalReserved
-	if available < 0 {
-		logger.Error("treasury oversold: available balance is negative",
-			zap.Int64("total_treasury", totalTreasury),
-			zap.Int64("total_reserved", totalReserved),
-		)
-		return 0, ErrInsufficientBalance
-	}
-
-	return available, nil
-}
-
-// AcquireTreasuryLock acquires a distributed lock for treasury reserve operations.
-// Used by fund_card workers to prevent race conditions when multiple workers
-// try to reserve balance simultaneously:
-//
-//	acquired, err := s.AcquireTreasuryLock(ctx)
-//	if !acquired { /* another worker is reserving */ }
-//	defer s.ReleaseTreasuryLock(ctx)
-//	balance, _ := s.GetTreasuryAvailableBalance(ctx)
-//	// ... reserve card ...
-//
-// Returns true if the lock was acquired, false if another process holds it.
-func (s *Service) AcquireTreasuryLock(ctx context.Context) (bool, error) {
-	acquired, err := cache.SetNX(ctx, treasuryLockKey, "locked", treasuryLockTTL)
-	if err != nil {
-		return false, fmt.Errorf("failed to acquire treasury lock: %w", err)
-	}
-	if !acquired {
-		return false, ErrTreasuryLockBusy
-	}
-	return true, nil
-}
-
-// ReleaseTreasuryLock releases the distributed treasury lock.
-func (s *Service) ReleaseTreasuryLock(ctx context.Context) {
-	if _, err := cache.Delete(ctx, treasuryLockKey); err != nil {
-		logger.Warn("failed to release treasury lock", zap.Error(err))
+// IsValid returns true if the currency is a supported fiat currency.
+func (c CreateCardFiatCurrency) IsValid() bool {
+	switch c {
+	case USD, EUR:
+		return true
+	default:
+		return false
 	}
 }
 
-// InvalidateTreasuryCache removes the cached treasury balance.
-// Call after card funding or redemption to force a fresh computation.
-func (s *Service) InvalidateTreasuryCache(ctx context.Context) {
-	if _, err := cache.Delete(ctx, treasuryAvailableCacheKey); err != nil {
-		logger.Warn("failed to invalidate treasury cache", zap.Error(err))
-	}
-}
-
-// CreateCardRequest contains the parameters for creating a new gift card
-// Note: BTCAmountSats is NOT provided at creation - it will be calculated and set
-// by the funding worker based on the current BTC/fiat exchange rate.
+// CreateCardRequest contains the parameters for creating a new gift card.
+// BTCAmountSats is NOT provided at creation — it will be calculated and set
+// by the fund_card worker based on the current BTC/fiat exchange rate.
 type CreateCardRequest struct {
-	FiatAmountCents    int64  // Face value in cents ($100 = 10000)
-	FiatCurrency       string // "USD", "EUR", etc.
-	PurchasePriceCents int64  // Total charged including fees
+	FiatAmountCents    int64                  // Face value in cents ($100 = 10000)
+	FiatCurrency       CreateCardFiatCurrency // "USD", "EUR", etc.
+	PurchasePriceCents int64                  // Total charged including fees
 	UserID             *string
 	PurchaseEmail      string
 }
 
-// CreateCardResponse contains the created card details
+// CreateCardResponse contains the created card details.
 type CreateCardResponse struct {
 	CardID        string
 	Code          string
@@ -194,9 +140,34 @@ type CreateCardResponse struct {
 	CreatedAt     time.Time
 }
 
+// validateCreateRequest validates the create card request fields.
+func (s *Service) validateCreateRequest(req CreateCardRequest) error {
+	if !req.FiatCurrency.IsValid() {
+		return ErrInvalidCurrency
+	}
+	if req.FiatAmountCents <= 0 {
+		return ErrInvalidFiatAmount
+	}
+	if req.PurchasePriceCents <= 0 {
+		return ErrInvalidPurchase
+	}
+	if req.PurchaseEmail == "" {
+		return ErrMissingEmail
+	}
+	return nil
+}
+
 // CreateCard creates a new gift card as a balance claim on the treasury.
 // No wallet or private key is generated — cards are custodial.
+//
+// After persisting the card, it publishes a FundCardMessage to the "fund_card"
+// stream so a worker can fetch the BTC price and activate the card.
 func (s *Service) CreateCard(ctx context.Context, req CreateCardRequest) (*CreateCardResponse, error) {
+	// 0. Validate request
+	if err := s.validateCreateRequest(req); err != nil {
+		return nil, err
+	}
+
 	// 1. Generate a unique card code
 	code, err := s.generateCardCode(ctx)
 	if err != nil {
@@ -214,7 +185,7 @@ func (s *Service) CreateCard(ctx context.Context, req CreateCardRequest) (*Creat
 		Code:               code,
 		BTCAmountSats:      0, // Will be set by funding worker based on current BTC price
 		FiatAmountCents:    req.FiatAmountCents,
-		FiatCurrency:       req.FiatCurrency,
+		FiatCurrency:       string(req.FiatCurrency),
 		PurchasePriceCents: req.PurchasePriceCents,
 		Status:             database.Created,
 		CreatedAt:          time.Now().UTC(),
@@ -266,6 +237,7 @@ func (s *Service) CreateCard(ctx context.Context, req CreateCardRequest) (*Creat
 	}, nil
 }
 
+// RedeemCardMethod identifies the payment rail for a redemption.
 type RedeemCardMethod string
 
 const (
@@ -273,7 +245,7 @@ const (
 	Lightning RedeemCardMethod = "lightning"
 )
 
-// RedeemCardRequest contains the parameters for redeeming (spending) a card
+// RedeemCardRequest contains the parameters for redeeming (spending) a card.
 type RedeemCardRequest struct {
 	Code               string           // Card redemption code
 	Method             RedeemCardMethod // "lightning" or "onchain"
@@ -282,7 +254,7 @@ type RedeemCardRequest struct {
 	LightningInvoice   string           // BOLT11 invoice (required if method=lightning)
 }
 
-// RedeemCardResponse contains the redemption transaction details
+// RedeemCardResponse contains the redemption transaction details.
 type RedeemCardResponse struct {
 	TransactionID    string
 	Method           string  // "lightning" or "onchain"
@@ -294,7 +266,10 @@ type RedeemCardResponse struct {
 }
 
 // RedeemCard processes a card spend (full or partial) via Lightning or on-chain.
-// Cards support partial spends — multiple transactions until balance = 0.
+// Cards support partial spends — multiple transactions until balance reaches 0.
+//
+// Concurrency: a per-card Redis lock prevents double-spend from concurrent requests.
+// On-chain transactions publish a MonitorTransactionMessage for confirmation tracking.
 func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*RedeemCardResponse, error) {
 	// Step 1: Validate input
 	if err := s.validateRedeemRequest(req); err != nil {
@@ -364,8 +339,258 @@ func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*Redee
 	}, nil
 }
 
+// --- Card queries ----------------------------------------------------------
+
+// GetCardByCode retrieves card details by redemption code.
+func (s *Service) GetCardByCode(ctx context.Context, code string) (*database.Card, error) {
+	card, err := s.cardRepo.GetByCode(ctx, code)
+	if err != nil {
+		if errors.Is(err, database.ErrCardNotFound) {
+			return nil, ErrCardNotFound
+		}
+		return nil, fmt.Errorf("failed to get card: %w", err)
+	}
+	return card, nil
+}
+
+// GetCardBalance returns the remaining balance (in satoshis) for a card.
+// In the custodial model, this is simply the btc_amount_sats field in the database.
+func (s *Service) GetCardBalance(ctx context.Context, cardID string) (int64, error) {
+	card, err := s.cardRepo.GetByID(ctx, cardID)
+	if err != nil {
+		if errors.Is(err, database.ErrCardNotFound) {
+			return 0, ErrCardNotFound
+		}
+		return 0, fmt.Errorf("failed to get card: %w", err)
+	}
+	return card.BTCAmountSats, nil
+}
+
+// ValidateCardCode checks if a card code is valid and usable.
+// Returns the card status without sensitive information.
+func (s *Service) ValidateCardCode(ctx context.Context, code string) (database.CardStatus, error) {
+	card, err := s.cardRepo.GetByCode(ctx, code)
+	if err != nil {
+		if errors.Is(err, database.ErrCardNotFound) {
+			return database.Expired, ErrCardNotFound
+		}
+		return database.Expired, fmt.Errorf("failed to validate card: %w", err)
+	}
+	return card.Status, nil
+}
+
+// --- Treasury queries ------------------------------------------------------
+
+// GetTreasuryAvailableBalance returns the available treasury balance (total LND
+// holdings minus reserved card balances). Results are cached in Redis for 10s
+// to avoid hitting LND (~50-100ms latency) on every call.
+//
+// This is the API-safe method — use it for read-only endpoints.
+// Write paths (FundCard) bypass the cache via computeTreasuryBalance for
+// authoritative reads inside the treasury lock.
+func (s *Service) GetTreasuryAvailableBalance(ctx context.Context) (int64, error) {
+	// Try cache first
+	if cached, err := cache.Get(ctx, treasuryAvailableCacheKey); err == nil && cached != "" {
+		if val, parseErr := strconv.ParseInt(cached, 10, 64); parseErr == nil {
+			return val, nil
+		}
+		// Invalid cache value — fall through to recompute
+	}
+
+	// Compute from LND + DB
+	available, err := s.computeTreasuryBalance(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	// Cache the result (best-effort, don't fail on cache error)
+	if cacheErr := cache.Set(ctx, treasuryAvailableCacheKey, strconv.FormatInt(available, 10), treasuryAvailableCacheTTL); cacheErr != nil {
+		logger.Warn("failed to cache treasury balance", zap.Error(cacheErr))
+	}
+
+	return available, nil
+}
+
 // ============================================================================
-// RedeemCard helpers — each method has a single concern
+// Worker methods — called by background workers (fund_card, monitor_tx)
+// ============================================================================
+
+// FundCard reserves treasury balance for a card, activating it.
+// Called by the fund_card worker after fetching the BTC price and calculating satoshis.
+//
+// Flow:
+//  1. Validate card exists and is in Created status
+//  2. Set status to Funding (idempotency guard)
+//  3. Acquire treasury lock (prevent concurrent workers from overselling)
+//  4. Compute fresh treasury balance (bypasses cache for authoritative read)
+//  5. Update card: BTCAmountSats=satoshis, Status=Active, FundedAt=now
+//  6. Create Fund transaction record (accounting only — no blockchain tx)
+//  7. Invalidate treasury cache
+//
+// If treasury is insufficient, reverts card to Created for retry.
+func (s *Service) FundCard(ctx context.Context, cardID string, satoshis int64) error {
+	if satoshis <= 0 {
+		return errors.New("satoshis must be positive")
+	}
+
+	// Step 1: Fetch card and validate state
+	card, err := s.cardRepo.GetByID(ctx, cardID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch card: %w", err)
+	}
+
+	if card.Status != database.Created {
+		logger.Warn("Card already processed, skipping",
+			zap.String("card_id", card.ID),
+			zap.String("status", string(card.Status)),
+		)
+		return nil // Idempotent: skip already-funded cards
+	}
+
+	// Step 2: Set status to Funding (prevents duplicate processing)
+	if err := s.cardRepo.Update(ctx, card.ID, database.Funding, nil, nil, nil); err != nil {
+		return fmt.Errorf("failed to set funding status: %w", err)
+	}
+
+	// Step 3: Acquire treasury lock
+	acquired, err := s.AcquireTreasuryLock(ctx)
+	if err != nil {
+		s.revertCardToCreated(ctx, card.ID)
+		return fmt.Errorf("failed to acquire treasury lock: %w", err)
+	}
+	if !acquired {
+		s.revertCardToCreated(ctx, card.ID)
+		return ErrTreasuryLockBusy
+	}
+	defer s.ReleaseTreasuryLock(ctx)
+
+	// Step 4: Fresh treasury balance (cache bypassed — authoritative read inside lock)
+	available, err := s.computeTreasuryBalance(ctx)
+	if err != nil {
+		s.revertCardToCreated(ctx, card.ID)
+		return fmt.Errorf("failed to compute treasury balance: %w", err)
+	}
+
+	if available < satoshis {
+		s.revertCardToCreated(ctx, card.ID)
+		logger.Error("Treasury insufficient",
+			zap.String("card_id", card.ID),
+			zap.Int64("needed", satoshis),
+			zap.Int64("available", available),
+		)
+		return fmt.Errorf("treasury insufficient: need %d sats, have %d available", satoshis, available)
+	}
+
+	// Step 5: Activate card (reserve the balance — this IS the funding)
+	now := time.Now().UTC()
+	if err := s.cardRepo.Update(ctx, card.ID, database.Active, &satoshis, &now, nil); err != nil {
+		s.revertCardToCreated(ctx, card.ID)
+		return fmt.Errorf("failed to activate card: %w", err)
+	}
+
+	logger.Info("Card funded (balance reserved)",
+		zap.String("card_id", card.ID),
+		zap.Int64("satoshis", satoshis),
+		zap.Int64("treasury_available", available-satoshis),
+	)
+
+	// Step 6: Create Fund transaction record (accounting only — no blockchain tx)
+	tx := &database.Transaction{
+		ID:            uuid.New().String(),
+		CardID:        card.ID,
+		Type:          database.Fund,
+		BTCAmountSats: satoshis,
+		Status:        database.Confirmed,
+		Confirmations: 0,
+		CreatedAt:     now,
+		ConfirmedAt:   &now,
+	}
+	if err := s.txRepo.Create(ctx, tx); err != nil {
+		logger.Error("Failed to create fund transaction (card is active but tx not recorded)",
+			zap.String("card_id", card.ID),
+			zap.Error(err),
+		)
+	}
+
+	// Step 7: Invalidate treasury cache (balance changed)
+	s.InvalidateTreasuryCache(ctx)
+
+	return nil
+}
+
+// ============================================================================
+// Treasury internals — balance computation and distributed locking
+// ============================================================================
+
+// computeTreasuryBalance fetches LND balances and DB reserved amounts to
+// calculate the available treasury balance. This is the uncached, authoritative
+// computation — used inside the treasury lock by write paths (FundCard).
+//
+// API callers should use GetTreasuryAvailableBalance (cached) instead.
+func (s *Service) computeTreasuryBalance(ctx context.Context) (int64, error) {
+	channelBal, err := s.lndClient.GetChannelBalance(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get channel balance: %w", err)
+	}
+
+	walletBal, err := s.lndClient.GetWalletBalance(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get wallet balance: %w", err)
+	}
+
+	totalTreasury := channelBal.LocalSats + walletBal.ConfirmedSats
+
+	totalReserved, err := s.cardRepo.GetTotalReservedBalance(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch total reserved balance: %w", err)
+	}
+
+	available := totalTreasury - totalReserved
+	if available < 0 {
+		logger.Error("treasury oversold: available balance is negative",
+			zap.Int64("total_treasury", totalTreasury),
+			zap.Int64("total_reserved", totalReserved),
+		)
+		return 0, ErrInsufficientBalance
+	}
+
+	return available, nil
+}
+
+// AcquireTreasuryLock acquires a distributed lock for treasury reserve operations.
+// Used by FundCard to prevent race conditions when multiple workers try to
+// reserve balance simultaneously.
+//
+// Returns true if the lock was acquired, false if another process holds it.
+func (s *Service) AcquireTreasuryLock(ctx context.Context) (bool, error) {
+	acquired, err := cache.SetNX(ctx, treasuryLockKey, "locked", treasuryLockTTL)
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire treasury lock: %w", err)
+	}
+	if !acquired {
+		return false, ErrTreasuryLockBusy
+	}
+	return true, nil
+}
+
+// ReleaseTreasuryLock releases the distributed treasury lock.
+func (s *Service) ReleaseTreasuryLock(ctx context.Context) {
+	if _, err := cache.Delete(ctx, treasuryLockKey); err != nil {
+		logger.Warn("failed to release treasury lock", zap.Error(err))
+	}
+}
+
+// InvalidateTreasuryCache removes the cached treasury balance.
+// Called after card funding or redemption to force a fresh computation
+// on the next GetTreasuryAvailableBalance call.
+func (s *Service) InvalidateTreasuryCache(ctx context.Context) {
+	if _, err := cache.Delete(ctx, treasuryAvailableCacheKey); err != nil {
+		logger.Warn("failed to invalidate treasury cache", zap.Error(err))
+	}
+}
+
+// ============================================================================
+// RedeemCard helpers — private methods, each with a single concern
 // ============================================================================
 
 // validateRedeemRequest validates the redemption request fields.
@@ -599,53 +824,32 @@ func (s *Service) publishMonitorTransaction(ctx context.Context, cardID, txID, t
 	}
 }
 
-// GetCardByCode retrieves card details by redemption code.
-func (s *Service) GetCardByCode(ctx context.Context, code string) (*database.Card, error) {
-	card, err := s.cardRepo.GetByCode(ctx, code)
-	if err != nil {
-		if errors.Is(err, database.ErrCardNotFound) {
-			return nil, ErrCardNotFound
-		}
-		return nil, fmt.Errorf("failed to get card: %w", err)
+// ============================================================================
+// FundCard helpers
+// ============================================================================
+
+// revertCardToCreated resets a card back to Created status so it can be retried.
+func (s *Service) revertCardToCreated(ctx context.Context, cardID string) {
+	if err := s.cardRepo.Update(ctx, cardID, database.Created, nil, nil, nil); err != nil {
+		logger.Error("Failed to revert card to Created status",
+			zap.String("card_id", cardID),
+			zap.Error(err),
+		)
 	}
-	return card, nil
 }
 
-// GetCardBalance returns the remaining balance (in satoshis) for a card.
-// In the custodial model, this is simply the btc_amount_sats field in the database.
-func (s *Service) GetCardBalance(ctx context.Context, cardID string) (int64, error) {
-	card, err := s.cardRepo.GetByID(ctx, cardID)
-	if err != nil {
-		if errors.Is(err, database.ErrCardNotFound) {
-			return 0, ErrCardNotFound
-		}
-		return 0, fmt.Errorf("failed to get card: %w", err)
-	}
-	return card.BTCAmountSats, nil
-}
+// ============================================================================
+// Internal helpers
+// ============================================================================
 
-// ValidateCardCode checks if a card code is valid and usable.
-// Returns the card status without sensitive information.
-func (s *Service) ValidateCardCode(ctx context.Context, code string) (database.CardStatus, error) {
-	card, err := s.cardRepo.GetByCode(ctx, code)
-	if err != nil {
-		if errors.Is(err, database.ErrCardNotFound) {
-			return database.Expired, ErrCardNotFound
-		}
-		return database.Expired, fmt.Errorf("failed to validate card: %w", err)
-	}
-	return card.Status, nil
-}
-
-// Helper function to generate a unique card code
-// Format: GIFT-XXXX-YYYY-ZZZZ (16 alphanumeric characters in groups)
+// generateCardCode generates a unique card code.
+// Format: GIFT-XXXX-YYYY-ZZZZ (12 alphanumeric characters in 3 groups of 4).
+// Uses a character set that excludes visually ambiguous characters (O, 0, I, 1, L).
 func (s *Service) generateCardCode(ctx context.Context) (string, error) {
-	// Character set excluding visually similar characters (O, 0, I, 1, L)
 	const charset = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 	const codeLength = 16
 
 	for attempt := 0; attempt < 5; attempt++ {
-		// Generate 16 random characters
 		code := make([]byte, codeLength)
 		if _, err := rand.Read(code); err != nil {
 			return "", fmt.Errorf("failed to generate random bytes: %w", err)
@@ -654,7 +858,6 @@ func (s *Service) generateCardCode(ctx context.Context) (string, error) {
 			code[i] = charset[int(code[i])%len(charset)]
 		}
 
-		// Format as GIFT-XXXX-YYYY-ZZZZ
 		codeStr := string(code)
 		formattedCode := fmt.Sprintf("GIFT-%s-%s-%s",
 			codeStr[0:4],
@@ -666,10 +869,8 @@ func (s *Service) generateCardCode(ctx context.Context) (string, error) {
 		_, err := s.cardRepo.GetByCode(ctx, formattedCode)
 		if err != nil {
 			if errors.Is(err, database.ErrCardNotFound) {
-				// Code is unique, return it
 				return formattedCode, nil
 			}
-			// Other database error
 			return "", fmt.Errorf("failed to check code uniqueness: %w", err)
 		}
 		// Code exists, retry

@@ -1,7 +1,7 @@
 # BTC Gift Card Service - Implementation Roadmap
 
-**Last Updated:** February 16, 2026  
-**Status:** Planning Phase - Cost Optimization & Lightning Migration & Automation Research
+**Last Updated:** July 2025  
+**Status:** Phase 1 partially complete, Phase 3-4 core done — HTTP API + monitor_tx worker next
 
 ---
 
@@ -29,14 +29,40 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 
 ## Current Status (Completed ✅)
 
-- ✅ **Phase 1:** Exchange price providers (Coinbase, CoinGecko, Bitstamp) - 27 tests passing
-- ✅ **Phase 2:** Message queue system (Redis Streams) - 27 tests passing
-- ✅ **Phase 3:** Card service with async queue integration - 9 tests passing
-- ✅ **Phase 4:** Worker skeleton with comprehensive TODOs
-- ✅ **Documentation:** README, API docs, architecture diagrams
-- ✅ **Infrastructure:** PostgreSQL, Redis, basic Go services
+### Foundation (original)
+- ✅ Exchange price providers (Coinbase, CoinGecko, Bitstamp) — `internal/exchange/`
+- ✅ Message queue system (Redis Streams) — `pkg/cache/`, `internal/queue/`
+- ✅ Card service with async queue integration — `internal/card/service.go`
+- ✅ Documentation: README, API docs, architecture diagrams
+- ✅ Infrastructure: PostgreSQL, Redis, Docker Compose
 
-**Total Tests Passing:** 81
+### LND Package (47 unit + 7 integration tests)
+- ✅ gRPC client with TLS + macaroon auth — `internal/lnd/client.go`
+- ✅ Lightning payments (SendPaymentV2 streaming) — `internal/lnd/lightning.go`
+- ✅ On-chain transactions (SendCoins, NewAddress, WalletBalance) — `internal/lnd/onchain.go`
+- ✅ Treasury queries (ChannelBalance, GetInfo) — `internal/lnd/treasury.go`
+- ✅ LND v0.20.1-beta module, Docker container on testnet (neutrino SPV)
+
+### Card Service — Business Logic (`internal/card/service.go`)
+- ✅ **CreateCard** with `validateCreateRequest` — currency, amount, email validation
+- ✅ **FundCard** — treasury lock + balance check + card activation + revert-on-failure
+- ✅ **RedeemCard** — 8-step orchestrator with Lightning + on-chain dual path
+- ✅ **GetCardByCode, GetCardBalance, ValidateCardCode** — read-only API methods
+- ✅ **GetTreasuryAvailableBalance** — Redis-cached (10s TTL) for API endpoints
+- ✅ Treasury distributed locking (Redis SETNX 5s TTL) + per-card locks (10s TTL)
+- ✅ `computeTreasuryBalance` — uncached authoritative balance for write paths
+- ✅ 14 sentinel errors, string-based enums, `CreateCardFiatCurrency` (USD/EUR)
+- ✅ `MonitorTransactionMessage` publishing for on-chain redemptions
+
+### Workers
+- ✅ **fund_card worker** — thin adapter delegating to `card.Service.FundCard()`
+
+### Database
+- ✅ String-based enums: `CardStatus`, `TransactionType`, `TransactionStatus`
+- ✅ Custodial model: no wallet-per-card, cards are balance claims on treasury
+- ✅ Redemption fields on transactions table (method, payment_hash, preimage, invoice)
+- ✅ CardRepository (Create, GetByCode, GetByID, Update, ListByUserID, GetTotalReservedBalance)
+- ✅ TransactionRepository (Create, GetByID, GetByTxHash, ListByCardID, Update)
 
 ---
 
@@ -102,12 +128,12 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
   - Store encrypted key in secure location (consider HSM for production)
   - **Estimated effort:** 6-8 hours
 
-- [ ] **Implement balance tracking**
-  - Function: `GetTreasuryBalance()` - query blockchain + pending reservations
-  - Function: `ReserveBalance(cardID, amountSats)` - Redis distributed lock
-  - Function: `ReleaseReservation(cardID)` - unlock on success/failure
-  - Database table: `balance_reservations`
-  - **Estimated effort:** 4-6 hours
+- [x] **Implement balance tracking** ✅ Done
+  - `computeTreasuryBalance()` — queries LND (on-chain + channel) minus reserved card balances
+  - `GetTreasuryAvailableBalance()` — Redis-cached (10s TTL) for API endpoints
+  - `AcquireTreasuryLock()` / `ReleaseTreasuryLock()` — Redis SETNX distributed lock (5s TTL)
+  - `InvalidateTreasuryCache()` — bust cache after mutations
+  - Per-card Redis lock `card:lock:{code}` (10s TTL) for concurrent redemption safety
 
 - [ ] **Implement automated OTC purchase flow (Crypto.com OTC 2.0 API)**
   - Create `internal/treasury/otc_provider.go`
@@ -155,20 +181,11 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 **Priority:** HIGH  
 **Status:** Skeleton exists, TODOs updated for custodial model
 
-- [ ] **Implement `cmd/worker/fund_card/main.go`**
-  - Consume FundCardMessage from Redis "fund_card" stream
-  - Fetch BTC price from OTC provider (Crypto.com OTC 2.0 — our actual cost basis)
-  - Calculate BTC amount (satoshis) for card's fiat value
-  - Check treasury available balance (prevent overselling)
-    - Available = Total Treasury (LN channels + hot wallet) - SUM(unredeemed card balances)
-    - Use distributed lock (Redis SETNX) for concurrent worker safety
-  - Update card: `btc_amount_sats = X`, `status = Active`, `funded_at = now`
-  - Create Fund transaction record (accounting only — no tx_hash, no addresses)
-  - **No blockchain transaction** — BTC stays in treasury, card is a balance claim
-  - Handle errors: retry on transient (OTC API timeout, DB down), skip on permanent (card already funded)
-  - **Estimated effort:** 6-8 hours
-  - **Prerequisite:** `CardRepository.Fund(ctx, cardID, satoshis)` method with atomic update
-    - SQL: `UPDATE cards SET btc_amount_sats = $2, status = 'active', funded_at = now() WHERE id = $1 AND status = 'funding'`
+- [x] **Implement `cmd/worker/fund_card/main.go`** ✅ Done
+  - Worker is a thin adapter: parse message → fetch price → calculate sats → delegate to `card.Service.FundCard()`
+  - `Service.FundCard()` handles: treasury lock → balance check → card activation → tx creation → cache invalidation → revert-on-failure
+  - Uses `exchange.PriceProvider` (Coinbase/CoinGecko/Bitstamp) for price fetching
+  - String-based enums throughout, per-card distributed locking
 
 - [ ] **Add OTC price source to exchange provider**
   - Add `cryptocom_otc` provider to `internal/exchange/provider.go`
@@ -310,13 +327,12 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 **Priority:** HIGH (if pursuing Lightning)  
 **Prerequisites:** Phase 1 complete and generating revenue
 
-- [ ] **Deploy LND node**
-  - Server requirements: 4GB RAM, 100GB SSD, stable internet
-  - Install LND (Lightning Network Daemon)
-  - Sync Bitcoin node or use Neutrino (light client)
-  - Configure LND for mainnet
-  - Secure macaroon authentication
-  - **Estimated effort:** 8-10 hours + 1-2 days sync time
+- [x] **Deploy LND node** ✅ Done
+  - Docker container with LND v0.18.4-beta on testnet (neutrino SPV backend)
+  - Named volume `lnd_data` for persistence
+  - Go module uses `lnd@v0.20.1-beta` with protobuf replace directive
+  - Macaroon authentication + TLS configured
+  - Config struct: GRPCHost, Port, TLSCertPath, MacaroonPath, Network, PaymentTimeoutSeconds, MaxPaymentFeeSats
 
 - [ ] **Open Lightning channels**
   - Research hub selection (ACINQ, Bitrefill, LNBig)
@@ -335,12 +351,13 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 
 ### 3.2 Lightning Wallet Integration
 
-- [ ] **Replace btcsuite with LND client**
-  - Install `github.com/lightningnetwork/lnd/lnrpc`
-  - Implement gRPC connection to LND
-  - Create `internal/lightning/client.go`
-  - Functions: CreateInvoice(), SendPayment(), DecodeInvoice()
-  - **Estimated effort:** 8-10 hours
+- [x] **Replace btcsuite with LND client** ✅ Done
+  - Created `internal/lnd/client.go` (gRPC + TLS + macaroon, `LightningClient` interface)
+  - `internal/lnd/lightning.go`: `PayInvoice` (SendPaymentV2 streaming), `DecodeInvoice`
+  - `internal/lnd/onchain.go`: `SendOnChain`, `NewAddress`, `GetWalletBalance`
+  - `internal/lnd/treasury.go`: `GetChannelBalance`, `GetInfo`
+  - 47 unit tests + 7 integration tests passing
+  - `PaymentResultStatus` enum: Succeeded/Failed/InFlight
 
 - [ ] **Update database schema for custodial model**
   ```sql
@@ -361,17 +378,12 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
     - Each transaction independently chooses Lightning or on-chain
   - **Estimated effort:** 2-3 hours
 
-- [ ] **Update CreateCard for custodial model**
-  - Store card value in database (balance in sats)
-  - Card represents a CLAIM on our treasury
-  - No Bitcoin transaction happens yet (just accounting)
-  - **Card funding flow:** 
-    - User pays €100 via bank transfer
-    - Create card with balance: 0.0019 BTC (€95 after 5% fee)
-    - BTC stays in our Lightning channels - card is just a database entry
-    - User receives card details (card ID + redemption code)
-  - **Note:** BTC is only transferred when user redeems, not when card is created
-  - **Estimated effort:** 4-6 hours
+- [x] **Update CreateCard for custodial model** ✅ Done
+  - `CreateCard(ctx, req)` creates card as a balance claim on treasury
+  - No Bitcoin transaction, no wallet generation
+  - `validateCreateRequest()` validates currency, fiat amount, purchase price, email
+  - `CreateCardFiatCurrency` enum (USD/EUR) with `IsValid()` method
+  - Card status starts as `Created`, transitions to `Funding` → `Active` via FundCard
 
 ### 3.3 Custodial Treasury System
 
@@ -392,12 +404,13 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 - Card creation is just accounting - BTC only moves when user redeems
 - Lightning channels can ONLY send Lightning payments (that's why we need hot wallet for on-chain)
 
-- [ ] **Implement treasury management system**
-  - On-chain wallet: Receive from OTC providers (primary treasury)
-  - Lightning channels: Lock 80-90% of treasury for instant Lightning redemptions
-  - Hot wallet: Keep 10-20% on-chain for users who need on-chain (exchanges, hardware wallets)
-  - **Database:** Track total treasury balance vs reserved balances (unredeemed cards)
-  - **Formula:** Available = Total Treasury - Sum(Unredeemed Card Balances)
+- [x] **Implement treasury management system** ✅ Done
+  - `computeTreasuryBalance()`: LND on-chain wallet + channel balance - reserved card balances
+  - `GetTreasuryAvailableBalance()`: Redis-cached (10s TTL) for API reads
+  - `AcquireTreasuryLock()` / `ReleaseTreasuryLock()`: Redis SETNX distributed lock (5s TTL)
+  - `InvalidateTreasuryCache()`: Cache busting after mutations
+  - Formula: Available = (WalletBalance + ChannelBalance) - TotalReservedBalance
+  - Hot wallet + Lightning channel split tracked via LND queries
   - **Why both?** Lightning adoption is growing but not universal. Maximize market reach.
   - **Estimated effort:** 6-8 hours
 
@@ -483,47 +496,23 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 
 ### 4.2 Redemption API Updates
 
-- [ ] **Update `POST /api/cards/{id}/redeem` endpoint**
-  - Accept request body:
-    ```json
-    {
-      "method": "lightning",
-      "lightning_invoice": "lnbc...",
-      "amount_sats": 50000
-    }
-    ```
-    OR
-    ```json
-    {
-      "method": "onchain",
-      "address": "bc1q...",
-      "amount_sats": 100000
-    }
-    ```
-  - **Partial spend support:** `amount_sats` can be less than card balance
-  - Creates a Transaction record with `redemption_method`, Lightning or on-chain fields
-  - Deducts `amount_sats` from card's `btc_amount_sats`
-  - Card stays `active` until balance = 0, then becomes `redeemed` with `redeemed_at` set
-  - **Lightning redemption:** Pay user's invoice from our channel (instant, FREE)
-  - **On-chain redemption:** Send from hot wallet to user's address (30 min, fee deducted)
-  - Validate Lightning invoice amount matches requested `amount_sats`
-  - Validate on-chain address (checksum, network)
-  - **Estimated effort:** 6-8 hours
+- [x] **Update `POST /api/cards/{id}/redeem` endpoint** ✅ Done (business logic)
+  - `RedeemCard(ctx, req)` accepts method (`lightning`/`onchain`), invoice/address, amount_sats
+  - Partial spend support: amount_sats can be less than card balance
+  - Creates Transaction record with redemption_method + Lightning or on-chain fields
+  - Deducts amount_sats from card's btc_amount_sats
+  - Card stays `Active` until balance = 0, then becomes `Redeemed`
+  - Validates Lightning invoice amount and on-chain address (wallet.ValidateAddress)
+  - 8-step orchestrator: validate → lock → check card → pay → record tx → update balance → publish monitor
+  - ⚠️ **HTTP handler not yet wired** — business logic exists but no route serves it
 
-- [ ] **Implement dual redemption worker**
-  - New worker: `cmd/worke (90% of users with Lightning wallets):**
-    - Pay user's Lightning invoice from our channel balance
-    - Lightning → Lightning (both sides stay in Lightning Network)
-    - Update card status immediately on payment success
-    - Cost: €0.001, Time: 1 second
-  - **On-chain redemption (10% of users with exchange wallets):**
-    - Send from hot wallet (on-chain reserve) to user's address
-    - Wait for confirmations
-    - Cost: €0.50, Time: 30 minutes
-    - **Note:** This is why we keep 10-20% of treasury on-chain (not in channels)address
-    - Wait for confirmations
-    - Cost: €0.50, Time: 30 minutes
-  - **Estimated effort:** 8-10 hours
+- [x] **Implement dual redemption worker** ✅ Done (in Service, not separate worker)
+  - `executePayment()` dispatches to `executeLightningPayment()` or `executeOnChainPayment()`
+  - **Lightning path:** `lndClient.PayInvoice()` (SendPaymentV2 streaming, maxFeeSats from config)
+  - **On-chain path:** `lndClient.SendOnChain()` (targetConf from config, minOnChainAmountSats=10000)
+  - `publishMonitorTransaction()` sends `MonitorTransactionMessage` to `"monitor_tx"` stream
+  - PaymentResult.Status checked for Succeeded/Failed/InFlight
+  - ⚠️ **monitor_tx consumer worker not yet created**
 
 ### 4.3 User Experience - Lightning First
 

@@ -1,792 +1,159 @@
-# BTC Gift Card - Bitcoin Gift Card Platform
+# BTC Gift Card — Bitcoin Gift Card Platform
 
-A Bitcoin gift card system that allows users to purchase, store, and redeem Bitcoin through digital gift cards.
-
----
-
-## System Overview
-
-### What This System Does
-
-1. **User purchases a gift card** with fiat money (USD, EUR, etc.)
-2. **System buys Bitcoin** and stores it in a unique wallet per card
-3. **User receives a card code** (voucher) - NOT the private key
-4. **Card can be redeemed** by providing the code + destination Bitcoin address
-5. **System sends BTC** from the card's wallet to user's address
-6. **Merchants can accept cards** for payment (optional feature)
-
-### Custodial Model
-
-**Important:** This is a **custodial voucher system**:
-
-- ✅ Each card is backed by a dedicated Bitcoin wallet address
-- ✅ Private keys are encrypted and stored in the database
-- ✅ Users receive a **redemption code** (e.g., "GIFT-XXXX-YYYY-ZZZZ")
-- ❌ Users do NOT receive the private key
-- ⚠️ Platform controls the Bitcoin and acts as custodian
-- ⚠️ Users must trust the platform to honor redemption requests
-
-**This is similar to:** Azteco vouchers, casino chips, Starbucks cards  
-**This is NOT:** Paper wallets, hardware wallets, self-custodial solutions
+A custodial Bitcoin gift card service built in Go. Users purchase gift cards with fiat, and the platform holds BTC in a shared treasury (LND Lightning node). Cards are balance claims — BTC only moves when a user redeems via Lightning Network (instant) or on-chain (standard).
 
 ---
 
-## Complete Flow Diagrams
+## How It Works
 
-### 1. Gift Card Purchase Flow
+### For Users
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant API
-    participant Stripe
-    participant Wallet
-    participant DB
-    participant Queue
-    participant Exchange
-    participant Email
-
-    User->>API: Purchase $100 card<br/>{fiat_amount, email}
-    API->>Stripe: Charge $103 (with fees)
-    Stripe-->>API: Payment confirmed
-
-    API->>Wallet: Generate new wallet
-    Wallet-->>API: Address + Private Key
-
-    API->>API: Encrypt private key (AES-256)
-    API->>DB: Save card<br/>(Status=Created, BTCAmountSats=0,<br/>purchase_email=email)
-    DB-->>API: Card saved
-
-    Note over Queue: Funding Worker (async - Redis Streams)
-    Queue->>Exchange: Get current BTC price
-    Exchange-->>Queue: $67,000 per BTC
-    Queue->>Queue: Calculate: $100 / $67,000 = 0.00149254 BTC
-    Queue->>Wallet: Send 149,254 sats to card address
-    Wallet-->>Queue: Transaction broadcast
-    Queue->>DB: Update card<br/>(Status=Funding, BTCAmountSats=149254)
-
-    Note over Queue: Monitor Worker (async - Redis Streams)
-    Queue->>Wallet: Check confirmations
-    Wallet-->>Queue: 1+ confirmations
-    Queue->>DB: Update card (Status=Active)
-
-    Queue->>Email: Send card code + QR
-    Email-->>User: Email with redemption code
-    Note over User: Card ready to redeem!
-```
-
-**Key Points:**
-- Email required for card delivery and redemption verification
-- Card created with Status=Created, BTCAmountSats=0
-- BTC amount set during funding based on current exchange rate
-- Eliminates exchange rate risk
-
----
-
-### 2. Gift Card Redemption Flow
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant API
-    participant Email
-    participant Redis
-    participant DB
-    participant Crypto
-    participant Bitcoin
-
-    Note over User,Bitcoin: Phase 1: Initiate Redemption
-    User->>API: POST /redeem/initiate<br/>{code, email}
-    API->>DB: Get card by code
-    DB-->>API: Card found (status=Active)
-    API->>API: Verify email matches purchase_email
-    API->>Redis: Check rate limit (IP)
-    Redis-->>API: Attempts OK (< 3/hour)
-    
-    API->>API: Generate 6-digit code
-    API->>Redis: Store verification code (TTL 10min)
-    API->>Email: Send verification email
-    Email-->>User: Email with code: 123456
-    API-->>User: {verification_request_id}
-
-    Note over User,Bitcoin: Phase 2: Complete Redemption
-    User->>API: POST /redeem/complete<br/>{verification_request_id, code, address}
-    API->>Redis: Validate verification code
-    Redis-->>API: Code valid
-    
-    API->>Redis: SetNX lock:card_id
-    Redis-->>API: Lock acquired
-    
-    API->>API: Validate BTC address format
-    API->>DB: Get encrypted private key
-    DB-->>API: Encrypted key
-    
-    API->>Crypto: Decrypt private key
-    Crypto-->>API: Private key (in memory)
-    
-    API->>Bitcoin: Create & sign transaction
-    API->>Bitcoin: Broadcast transaction
-    Bitcoin-->>API: Transaction hash
-    
-    API->>DB: Update card (status=Redeemed, tx_hash)
-    API->>Crypto: Clear private key from memory
-    API->>Redis: Delete verification code
-    API->>Redis: Release lock
-    
-    API->>Email: Send confirmation (tx_hash)
-    API-->>User: {transaction_id, tx_hash}
-    
-    Note over User: BTC arrives after 1+ confirmations
-```
-
-**Security:**
-- Email verification required (6-digit code)
-- Rate limiting (3 attempts per hour)
-- Card lockout after 5 failed attempts
-
----
-
-## How to Use Gift Cards
-
-### **Redeem to Your Wallet** (Current)
-
-User receives full card balance in their Bitcoin wallet:
-
-1. Enter card code
-2. Verify email (receive 6-digit code)
-3. Provide Bitcoin address
-4. Receive BTC (10-60 minutes)
-
-**Result:** Card marked as Redeemed, cannot be reused
-
-### **Pay at Merchants** (Future)
-
-User pays at stores using card balance:
-
-1. Merchant shows QR code
-2. Scan QR with app
-3. Verify email (receive 6-digit code)
-4. Payment processed instantly
-5. Card balance reduced
-
-**Result:** Card remains Active, can be used again until balance = 0
-
----
-
-### 3. In-Store Payment Flow (Future)
-
-```mermaid
-flowchart TD
-    A[Customer at Store<br/>Bill: $10] --> B[Merchant Shows QR Code<br/>Invoice Details]
-    B --> C[Customer Scans QR]
-    C --> D{Card Valid?}
-    D -->|No| E[Show Error]
-    D -->|Yes| F{Sufficient<br/>Balance?}
-    F -->|No| E
-    F -->|Yes| G[Email Verification]
-    G --> H{Settlement<br/>Type?}
-
-    H -->|Fiat| I[Deduct from Card Balance]
-    I --> J[Queue Merchant Payout]
-    J --> K[Send Receipt to Customer]
-
-    H -->|BTC Direct| L[Send BTC to Merchant]
-    L --> K
-
-    K --> M[Show Remaining Balance]
-```
-
----
-
-## Data Storage Structure
-
-### Database Schema (PostgreSQL)
-
-```mermaid
-erDiagram
-    USERS ||--o{ CARDS : owns
-    CARDS ||--o{ TRANSACTIONS : has
-
-    USERS {
-        uuid id PK
-        varchar email UK
-        varchar password_hash
-        timestamp created_at
-    }
-
-    CARDS {
-        uuid id PK
-        uuid user_id FK "nullable"
-        varchar purchase_email "required for security"
-        varchar code UK "GIFT-XXXX-YYYY-ZZZZ"
-        varchar wallet_address UK "bc1q..."
-        text encrypted_priv_key "AES-256 encrypted"
-        bigint btc_amount_sats "152345 sats"
-        bigint fiat_amount_cents "10050 cents"
-        varchar fiat_currency "USD"
-        bigint purchase_price_cents "10300 cents"
-        varchar status "created/funding/active/redeemed/expired"
-        timestamp created_at
-        timestamp funded_at "nullable"
-        timestamp redeemed_at "nullable"
-    }
-
-    TRANSACTIONS {
-        uuid id PK
-        uuid card_id FK
-        varchar type "fund/redeem/payment"
-        varchar tx_hash "nullable"
-        varchar from_address "nullable"
-        varchar to_address "nullable"
-        bigint btc_amount_sats "145000 sats"
-        varchar status "pending/confirmed/failed"
-        int confirmations
-        timestamp created_at
-        timestamp broadcast_at "nullable"
-        timestamp confirmed_at "nullable"
-    }
-
-    MERCHANTS {
-        uuid id PK
-        varchar name
-        varchar btc_address
-        varchar settlement_type "btc/fiat"
-        varchar bank_account "encrypted"
-    }
-```
-
-**Note:** Email is required at purchase for security (redemption verification) and delivery. User accounts (optional) can be linked later to manage multiple cards.
-
-### Redis Cache Structure
-
-```
-Key Pattern                          Value                    TTL
-──────────────────────────────────────────────────────────────────
-btc_price_usd                      "65432.50"               30s
-redemption_attempts:{ip}           "3"                      1h
-redeeming:{card_code}              "1" (lock)               5m
-card_balance:{wallet_address}      "0.0015"                 1m
-tx_status:{tx_hash}                "confirmed"              1h
-```
-
----
-
-## Security Layers
-
-### 1. Private Key Protection (Custodial Responsibility)
-
-**⚠️ CRITICAL:** Platform has full custody of all Bitcoin private keys.
-
-```mermaid
-flowchart TD
-    A[Master Encryption Key] -->|Stored in| B[AWS KMS / Vault]
-    B --> C[AES-256-GCM Encryption]
-    C --> D[Encrypted Private Key]
-    D -->|Stored in| E[PostgreSQL Database]
-    E -->|Decrypt during redemption| F[Private Key in Memory]
-    F -->|Sign transaction| G[Bitcoin Transaction]
-    G --> H[Clear from memory]
-
-    Note1["⚠️ Users never see private keys<br/>They only have redemption codes"] -.-> E
-    Note2["⚠️ Platform is Bitcoin custodian<br/>Must protect keys from theft"] -.-> B
-
-    style B fill:#f9f,stroke:#333
-    style E fill:#bbf,stroke:#333
-    style F fill:#faa,stroke:#333
-    style H fill:#afa,stroke:#333
-    style Note1 fill:#ffeeee
-    style Note2 fill:#ffeeee
-```
-
-### 2. Per-Card Wallet Architecture
-
-**Custodial Model:** Platform holds all private keys and acts as Bitcoin custodian.
-
-```mermaid
-graph TB
-    subgraph Funding["Bitcoin Funding Source"]
-        Exchange[Exchange API<br/>Coinbase/Kraken<br/>Buy BTC on demand]
-    end
-
-    subgraph Cards["Per-Card Wallets - Platform Controlled"]
-        C1["Card 1 Wallet<br/>bc1q123...<br/>Private Key: Encrypted in DB<br/>Balance: 0.001 BTC"]
-        C2["Card 2 Wallet<br/>bc1q456...<br/>Private Key: Encrypted in DB<br/>Balance: 0.005 BTC"]
-        C3["Card 3 Wallet<br/>bc1q789...<br/>Private Key: Encrypted in DB<br/>Balance: 0.002 BTC"]
-        CN["Card N Wallet<br/>bc1qXXX...<br/>Private Key: Encrypted in DB<br/>Balance: 0.003 BTC"]
-    end
-
-    subgraph Users["User Side"]
-        U1["User gets:<br/>Card Code: GIFT-XXXX<br/>NOT private key"]
-        U2["Redemption:<br/>Enter code + BTC address<br/>System signs & sends"]
-    end
-
-    Exchange -->|Fund on purchase| C1
-    Exchange -->|Fund on purchase| C2
-    Exchange -->|Fund on purchase| C3
-    Exchange -->|Fund on purchase| CN
-
-    C1 -.->|"Represented by"| U1
-    U1 -->|"Redeems via"| U2
-    U2 -->|"System sends BTC from"| C1
-
-    style Exchange fill:#e1f5ff
-    style C1 fill:#fff4e1
-    style C2 fill:#fff4e1
-    style C3 fill:#fff4e1
-    style CN fill:#fff4e1
-    style U1 fill:#f0f0f0
-    style U2 fill:#afa
-```
-
-**Key Points:**
-
-- Each card has a unique Bitcoin address (bc1q...)
-- Platform encrypts and stores ALL private keys
-- Users receive a redemption code, NOT the private key
-- Platform is the custodian and must honor redemption requests
-- Regulatory consideration: May require money transmitter license
-
-### 3. Attack Prevention
-
-| Attack Vector          | Protection                                 |
-| ---------------------- | ------------------------------------------ |
-| Brute force card codes | Rate limiting (Redis), long random codes   |
-| Double-spending        | Redis locks (SetNX), database transactions |
-| SQL injection          | Parameterized queries, ORM                 |
-| Private key theft      | Encryption at rest, AWS KMS                |
-| Hot wallet hack        | Limited funds (5%), multi-sig              |
-| Insider threat         | Audit logs, separation of duties           |
-| Man-in-the-middle      | HTTPS/TLS, certificate pinning             |
-
----
-
-## System Components
-
-### Backend Services Architecture
-
-```mermaid
-graph TB
-    subgraph "API Server (cmd/api)"
-        API[HTTP Endpoints]
-        Auth[Authentication]
-    end
-
-    subgraph "Business Logic (internal/)"
-        Card[Card Service]
-        Wallet[Wallet Service]
-        Crypto[Crypto Service]
-        Exchange[Exchange Service]
-        Merchant[Merchant Service]
-    end
-
-    subgraph "Infrastructure (pkg/)"
-        Logger[Logger - Zap]
-        Cache[Redis Cache]
-        Queue[Redis Streams]
-    end
-
-    subgraph "Worker (cmd/worker)"
-        FundJob[Fund Cards Worker<br/>Consumes: fund_card stream]
-        MonitorJob[Monitor Blockchain Worker<br/>Consumes: monitor_tx stream]
-    end
-
-    API --> Card
-    API --> Wallet
-    Card --> Crypto
-    Card --> Exchange
-    Card --> Cache
-    Card --> Queue
-
-    Queue --> FundJob
-    Queue --> MonitorJob
-
-    FundJob --> Wallet
-    MonitorJob --> Wallet
-```
-
-### External Dependencies
-
-```
-┌────────────────────────────────────────┐
-│ Bitcoin Network                        │
-│ • Testnet (development)                │
-│ • Mainnet (production)                 │
-└────────────────────────────────────────┘
-
-┌────────────────────────────────────────┐
-│ Exchange APIs                          │
-│ • Coinbase API (BTC price)             │
-│ • CoinGecko API (BTC price - backup)   │
-│ • Bitstamp API (BTC price - backup)    │
-└────────────────────────────────────────┘
-
-┌────────────────────────────────────────┐
-│ Payment Processing                     │
-│ • Stripe (credit card payments)        │
-└────────────────────────────────────────┘
-
-┌────────────────────────────────────────┐
-│ Infrastructure                         │
-│ • PostgreSQL (main database)           │
-│ • Redis (cache, streams, locks)        │
-└────────────────────────────────────────┘
-
-```
-
----
-
-## Message Queue (Redis Streams)
-
-### Architecture
-
-Redis Streams provide persistent message queue with consumer groups for distributed processing.
-
-**Streams:**
-- `fund_card` - Messages to fund newly created cards
-- `monitor_tx` - Messages to track blockchain confirmations
-
-**Consumer Groups:**
-- `workers` - Consumes from `fund_card` stream
-- `monitors` - Consumes from `monitor_tx` stream
-
-### Worker Flows
-
-**fund_card Worker:**
-```
-Job: fund_card
-├─ Triggered: After card creation (consumes from fund_card stream)
-├─ Action: Buy BTC and send to card's unique wallet
-├─ Details:
-│   • Consume FundCardMessage from fund_card stream (consumer group: workers)
-│   • Fetch current BTC price from exchange provider (Coinbase/CoinGecko/Bitstamp)
-│   • Calculate BTC amount: fiat_amount_cents / price
-│   • Buy BTC from exchange (Coinbase/Kraken API)
-│   • Send BTC to card's wallet address (blockchain transaction)
-│   • Update card status: Created → Funding
-│   • Store transaction hash in database
-│   • Publish MonitorTransactionMessage to monitor_tx stream
-│   • ACK message on success
-├─ Retry: 3 times with exponential backoff (Redis Streams auto-retry)
-├─ Error Handling: Log failure, update card status to failed, notify ops team
-└─ Duration: ~10-60 minutes (blockchain confirmation)
-```
-
-**monitor_tx Worker:**
-```
-Job: monitor_transaction
-├─ Triggered: After any transaction broadcast (consumes from monitor_tx stream)
-├─ Action: Monitor blockchain for confirmations
-├─ Details:
-│   • Consume MonitorTransactionMessage from monitor_tx stream (consumer group: monitors)
-│   • Query blockchain API (Blockstream/Mempool.space) for tx_hash
-│   • Check confirmation count
-│   • If confirmed (6+ confirmations):
-│       - Update transaction status to "confirmed" in database
-│       - Update card status to "Active"
-│       - Send confirmation email to user
-│       - ACK message
-│   • If pending (< 6 confirmations):
-│       - Re-queue message with delay (XADD with MAXLEN)
-│       - Next poll in 10 minutes
-│   • If transaction not found:
-│       - Check if mempool dropped (24h timeout)
-│       - Alert ops team if stuck
-├─ Retry: Poll every 10 minutes until 6 confirmations
-├─ Error Handling: Log API failures, retry with backoff
-└─ Duration: ~60 minutes (6 blocks × 10 min average)
-```
-
-### Message Examples
-
-**FundCardMessage:**
-```json
-{
-  "card_id": "550e8400-e29b-41d4-a716-446655440000",
-  "fiat_amount_cents": 10000,
-  "fiat_currency": "USD"
-}
-```
-
-**MonitorTransactionMessage:**
-```json
-{
-  "card_id": "550e8400-e29b-41d4-a716-446655440000",
-  "tx_hash": "abc123...",
-  "expected_amount_sats": 149254,
-  "destination_addr": "bc1q..."
-}
-```
-
----
-
-## Documentation
-
-- [API Documentation](docs/API_DOCUMENTATION.md) - Full API reference from `go doc`
-- See `go doc -all btc-giftcard/internal/queue` for package docs
-- See `go test ./... -v` for test coverage
-
----
-
-## Custodial Implications & Regulatory Considerations
-
-### ✅ Benefits of Custodial Voucher Model
-
-| Benefit                | Explanation                                                 |
-| ---------------------- | ----------------------------------------------------------- |
-| **Simpler UX**         | Users only need a code, no crypto wallet knowledge required |
-| **No key loss risk**   | Users can't lose/expose private keys (you manage them)      |
-| **Refunds possible**   | Can refund unused cards without blockchain interaction      |
-| **Support easier**     | Can help users recover access with verification             |
-| **Partial redemption** | Easy to implement (just update DB balance)                  |
-| **Gift-friendly**      | Giver doesn't need recipient's Bitcoin address upfront      |
-
-### ⚠️ Risks & Responsibilities
-
-| Risk                    | Mitigation                                              |
-| ----------------------- | ------------------------------------------------------- |
-| **Hot wallet hack**     | Limit online funds, use cold storage, multi-sig         |
-| **Database breach**     | Encrypt keys with KMS, regular security audits          |
-| **Insider theft**       | Separation of duties, audit logs, background checks     |
-| **Regulatory scrutiny** | Consult lawyers, may need money transmitter license     |
-| **Customer trust**      | Transparent operations, insurance, regular attestations |
-| **Liquidity risk**      | Maintain 100%+ Bitcoin reserves (proof of reserves)     |
-
-### 🏛️ Regulatory Requirements (Varies by Jurisdiction)
-
-**Likely Required:**
-
-- ✅ **Money Transmitter License** (US: state-by-state, EU: MiCA regulation)
-- ✅ **KYC/AML Compliance** (especially for cards >$1000)
-- ✅ **Proof of Reserves** (can you honor all redemptions?)
-- ✅ **Data Protection** (GDPR in EU, CCPA in California)
-- ✅ **Regular Audits** (financial + security)
-
-**Compliance Strategies:**
-
-- Start with low-value cards (<$500) to reduce regulatory burden
-- Partner with licensed exchange (Coinbase, Kraken) as custodian initially
-- Get legal counsel BEFORE launching (not after problems arise)
-- Consider operating through licensed entity (fintech-as-a-service)
-
-**Comparison with Non-Custodial Alternative:**
-
-| Aspect        | Your Model (Custodial Voucher) | True Non-Custodial (Paper Wallet) |
-| ------------- | ------------------------------ | --------------------------------- |
-| User gets     | Redemption code                | Private key (WIF or QR code)      |
-| Platform role | Custodian (holds keys)         | Software provider (no keys)       |
-| User risk     | Must trust platform            | Can lose/expose private key       |
-| Regulatory    | Money transmitter              | Likely just software service      |
-| UX complexity | Very simple                    | Requires crypto knowledge         |
-| Refunds       | Easy                           | Impossible (user has key)         |
-
----
-
-## Important Business Rules
+1. **Purchase** — Buy a gift card with fiat (USD/EUR). Receive a unique card code.
+2. **Fund** — A background worker fetches the current BTC price and assigns the equivalent satoshi balance to the card.
+3. **Redeem** — Provide your card code + a Lightning invoice or Bitcoin address. BTC is sent from the platform treasury directly to you.
+4. **Partial Spends** — Cards support multiple redemptions. The balance decreases with each spend until it reaches zero.
 
 ### Card Lifecycle
 
 ```mermaid
 stateDiagram-v2
     [*] --> Created
-    Created --> Funding: BTC purchase confirmed
-    Funding --> Active: Blockchain confirmed
-    Funding --> Expired: Funding timeout (24h)
-    Active --> Redeemed: User redeems
-    Expired --> [*]: Refund customer
-    Redeemed --> [*]: Final state
-
-    note right of Created
-        Card generated
-        Not funded yet
-    end note
-
-    note right of Funding
-        Waiting for
-        BTC transfer
-    end note
-
-    note right of Active
-        Card ready
-        to use
-    end note
-
-    note right of Redeemed
-        BTC sent to user
-        Cannot be reused
-    end note
+    Created --> Funding : worker picks up
+    Funding --> Active : BTC price fetched, sats assigned
+    Active --> Active : partial spend (balance reduced)
+    Active --> Redeemed : balance = 0
+    Funding --> Expired : funding timed out
 ```
 
-### Expiration Policy
-
-- **Active cards**: No expiration (user's money)
-- **Partially used cards**: No expiration
-- **Unclaimed cards**: After 5 years, escheat to state (legal requirement)
-
-### Fee Structure
-
-```
-Purchase:
-  Card Value:     $100.00
-  Platform Fee:   $  2.00  (2%)
-  Exchange Fee:   $  0.50  (0.5%)
-  Total Charged:  $102.50
-
-Redemption:
-  Card Balance:   0.0015 BTC
-  Network Fee:    0.0001 BTC (variable, ~$6.50)
-  User Receives:  0.0014 BTC (~$91)
-```
+| Status   | Meaning                                     |
+|----------|---------------------------------------------|
+| Created  | Card saved, awaiting BTC price + funding    |
+| Funding  | Worker is calculating sats and activating    |
+| Active   | Card has a BTC balance, ready to redeem      |
+| Redeemed | Balance is zero, card is fully spent         |
+| Expired  | Funding timed out (rare edge case)           |
 
 ---
 
-## Monitoring & Alerts
+## Architecture
 
-### Critical Metrics
+### Custodial Treasury Model
 
-- Hot wallet balance (alert if < $10K)
-- Failed transactions (alert if > 5 in 1 hour)
-- API response time (alert if > 2s)
-- Card redemption success rate (alert if < 95%)
-- Exchange API availability
+The platform does **not** create a wallet per card. Instead:
 
-### Dashboards
+- All BTC is held in a single LND Lightning node (channels + on-chain hot wallet).
+- Cards are database entries with a `btc_amount_sats` field representing their balance claim on the treasury.
+- BTC only leaves the treasury when a user redeems a card.
 
-- Real-time card purchases
-- Total BTC held
-- Pending redemptions
-- Revenue/fees collected
-- User geography
-
----
-
-## Quick Start
-
-### Initialize Project
-
-```bash
-# Initialize Go module (first time only)
-go mod init btc-giftcard
-
-# Install dependencies
-go mod download
-
-# Clean up unused dependencies
-go mod tidy
+```
+Treasury Balance = LND On-Chain Wallet + LND Channel Balance
+Available Balance = Treasury Balance − SUM(unredeemed card balances)
 ```
 
-### Install Dependencies
+### System Components
 
-```bash
-# Install specific packages
-go get go.uber.org/zap                    # Logger
-go get github.com/redis/go-redis/v9       # Redis client
-go get golang.org/x/crypto/argon2         # Encryption
+```mermaid
+graph TD
+    API["API Server - cmd/api/main.go"] -->|FundCardMessage| Q1["fund_card - Redis Stream"]
+    API -->|MonitorTxMessage| Q2["monitor_tx - Redis Stream"]
+    API --> DB[("PostgreSQL - cards · transactions")]
+    API -->|"PayInvoice · SendOnChain"| LND["LND Lightning Node - gRPC :10009"]
+
+    Q1 --> W1["fund_card worker - Fetch BTC price · Activate card"]
+    Q2 --> W2["monitor_tx worker - Poll tx confirms · Update status"]
+
+    W1 -->|"treasury check · card update"| DB
+    W2 -->|"update tx status"| DB
+    W1 -->|"GetChannelBalance · GetWalletBalance"| LND
+    W2 -->|"query tx confirms"| LND
 ```
 
----
+**API Endpoints:**
 
-## Running the Application
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/cards` | Create card |
+| `POST /api/cards/{code}/redeem` | Redeem card (Lightning/on-chain) |
+| `GET /api/cards/{code}` | Get card details |
+| `GET /api/cards/{code}/balance` | Get balance |
+| `GET /api/treasury/balance` | Available treasury sats |
+| `GET /health` | Health check |
 
-### Run Without Compiling
+**LND Operations:** PayInvoice, SendOnChain, GetWalletBalance, GetChannelBalance, NewAddress, GetInfo
 
-```bash
-# Run API server
-go run ./cmd/api
+### Purchase Flow
 
-# Run with environment variable
-ENVIRONMENT=production go run ./cmd/api
-ENVIRONMENT=development go run ./cmd/api
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant DB as PostgreSQL
+    participant Queue as Redis Stream
+    participant Worker as fund_card worker
+    participant Exchange as Price Provider
+    participant LND
+
+    User->>API: POST /api/cards {amount, currency, email}
+    API->>DB: Insert card (status=Created)
+    API->>Queue: Publish FundCardMessage
+    API-->>User: 201 {card_code}
+
+    Queue->>Worker: Consume message
+    Worker->>Exchange: GetPrice(currency)
+    Exchange-->>Worker: BTC price
+    Worker->>Worker: Calculate satoshis
+    Worker->>LND: GetChannelBalance + GetWalletBalance
+    LND-->>Worker: Treasury balance
+    Worker->>DB: Update card (sats, status=Active)
+    Worker->>DB: Insert transaction (type=fund)
 ```
 
-### Compile and Run
+### Redemption Flow
 
-```bash
-# Build binary
-go build -o bin/api cmd/api/main.go
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant DB as PostgreSQL
+    participant LND
+    participant Queue as Redis Stream
+    participant Monitor as monitor_tx worker
 
-# Run binary
-./bin/api
+    User->>API: POST /api/cards/{code}/redeem
+    API->>DB: Lock card, verify balance
+
+    alt Lightning
+        API->>LND: PayInvoice(invoice)
+        LND-->>API: payment_preimage
+        API->>DB: Update card balance, insert tx (confirmed)
+        API-->>User: 200 {preimage, remaining_balance}
+    else On-chain
+        API->>LND: SendOnChain(address, sats)
+        LND-->>API: tx_hash
+        API->>DB: Update card balance, insert tx (pending)
+        API->>Queue: Publish MonitorTxMessage
+        API-->>User: 200 {tx_hash, remaining_balance}
+
+        loop Until 6 confirmations
+            Queue->>Monitor: Consume message
+            Monitor->>LND: Query tx status
+            alt Confirmed
+                Monitor->>DB: Update tx (status=confirmed)
+            else Pending
+                Monitor->>Queue: Re-publish for later check
+            end
+        end
+    end
 ```
 
----
+### Redemption Paths
 
-## Testing
+| Method    | Speed    | Cost        | How                                      |
+|-----------|----------|-------------|------------------------------------------|
+| Lightning | Instant  | ~1 sat fee  | User provides BOLT11 invoice → LND pays  |
+| On-chain  | ~1 hour  | ~500+ sats  | User provides BTC address → LND sends    |
 
-### Run Tests
-
-```bash
-# Run all tests
-go test ./...
-
-# Run tests with verbose output
-go test ./... -v
-
-# Run specific package tests
-go test ./internal/crypto -v
-go test ./pkg/logger -v
-go test ./pkg/cache -v
-
-# Run specific test function
-go test ./internal/crypto -run TestEncryptDecrypt -v
-```
-
-### Test Coverage
-
-```bash
-# Show coverage percentage
-go test ./internal/crypto -cover
-
-# Generate detailed coverage report
-go test ./internal/crypto -coverprofile=coverage.out
-go tool cover -html=coverage.out
-```
-
-### Benchmarks
-
-```bash
-# Run all benchmarks
-go test ./internal/crypto -bench=.
-
-# Run with memory stats
-go test ./internal/crypto -bench=. -benchmem
-
-# Run specific benchmark
-go test ./internal/crypto -bench=BenchmarkEncrypt
-```
-
----
-
-## Code Quality
-
-### Format Code
-
-```bash
-# Format all files
-go fmt ./...
-
-# Check for common mistakes
-go vet ./...
-```
-
----
-
-## Docker (Redis)
-
-### Start Redis
-
-```bash
-# Start Redis with Docker Compose
-docker-compose up -d
-
-# View Redis logs
-docker logs btc-giftcard-redis-1
-```
-
-### Stop Services
-
-```bash
-docker-compose down
-```
+Lightning payments confirm immediately. On-chain payments are tracked by the `monitor_tx` worker until they reach 6 confirmations.
 
 ---
 
@@ -795,77 +162,194 @@ docker-compose down
 ```
 btc-giftcard/
 ├── cmd/
-│   ├── api/              # HTTP API server
-│   ├── worker/           # Background job processor
-│   └── migrate/          # Database migrations
+│   ├── api/                    # HTTP API server
+│   │   ├── main.go             #   Entrypoint: init infra, start server
+│   │   ├── routes.go           #   Router setup + middleware chain
+│   │   ├── handlers.go         #   HTTP handlers (card, treasury, health)
+│   │   └── middleware.go       #   Logging, recovery, CORS, error helpers
+│   ├── worker/
+│   │   ├── fund_card/          # Fund card worker
+│   │   │   └── main.go         #   Fetch price → calculate sats → delegate to Service.FundCard
+│   │   └── monitor_tx/         # Monitor transaction worker
+│   │       └── main.go         #   Poll on-chain tx confirmations → update status
+│   └── migrate/                # Database migration runner
 ├── internal/
-│   ├── card/            # Gift card business logic
-│   ├── wallet/          # Bitcoin wallet operations
-│   ├── crypto/          # Encryption/decryption
-│   ├── exchange/        # Exchange integrations
-│   ├── payment/         # Payment processing
-│   └── database/        # Database layer
+│   ├── card/                   # Core business logic
+│   │   ├── service.go          #   Card lifecycle, treasury, redemption
+│   │   └── service_test.go     #   Integration tests
+│   ├── lnd/                    # LND gRPC client wrapper
+│   │   ├── client.go           #   Connection, TLS, macaroon auth
+│   │   ├── lightning.go        #   PayInvoice, DecodeInvoice
+│   │   ├── onchain.go          #   SendOnChain, NewAddress, GetWalletBalance
+│   │   ├── treasury.go         #   GetChannelBalance, GetInfo
+│   │   └── *_test.go           #   47 unit + 7 integration tests
+│   ├── database/               # PostgreSQL models + repositories
+│   │   ├── model.go            #   Card, Transaction, enums
+│   │   ├── card_repository.go  #   CRUD for cards
+│   │   └── transaction_repository.go # CRUD for transactions
+│   ├── queue/                  # Message definitions
+│   │   └── messages.go         #   FundCardMessage, MonitorTransactionMessage
+│   ├── exchange/               # BTC/fiat price providers
+│   │   └── provider.go         #   Coinbase, CoinGecko, Bitstamp
+│   ├── wallet/                 # Bitcoin address validation (btcutil)
+│   ├── crypto/                 # AES-256-GCM encryption utilities
+│   ├── payment/                # (placeholder) Bank transfer integration
+│   └── merchant/               # (placeholder) Merchant payment features
 ├── pkg/
-│   ├── cache/           # Redis cache wrapper
-│   ├── queue/           # Redis Streams wrapper
-│   └── logger/          # Zap logging utilities
-└── config/              # Configuration files
+│   ├── cache/                  # Redis client wrapper (Get/Set/SetNX/Delete/Incr)
+│   ├── queue/                  # Redis Streams consumer/producer
+│   └── logger/                 # Zap structured logging
+├── config/                     # Config structs + TOML loader
+├── config.toml                 # App configuration
+├── docker-compose.yml          # PostgreSQL, Redis, LND containers
+├── migrations/                 # SQL migration files
+└── lnd-creds/                  # TLS cert + macaroon (git-ignored)
 ```
 
 ---
 
-## Environment Variables
+## Database Schema
+
+### Cards
+
+| Column               | Type      | Description                                |
+|----------------------|-----------|--------------------------------------------|
+| id                   | UUID PK   | Card identifier                            |
+| user_id              | UUID NULL | Optional link to a user account            |
+| purchase_email       | TEXT      | Buyer's email (for delivery + verification)|
+| owner_email          | TEXT      | Current owner's email                      |
+| code                 | TEXT UQ   | Redemption code (e.g. GIFT-XXXX-YYYY-ZZZZ)|
+| btc_amount_sats      | BIGINT    | Remaining balance in satoshis              |
+| fiat_amount_cents    | BIGINT    | Face value in cents                        |
+| fiat_currency        | TEXT      | USD or EUR                                 |
+| purchase_price_cents | BIGINT    | Total charged (including fees)             |
+| status               | TEXT      | created / funding / active / redeemed / expired |
+| created_at           | TIMESTAMP | Card creation time                         |
+| funded_at            | TIMESTAMP | When balance was assigned                  |
+| redeemed_at          | TIMESTAMP | When balance reached zero                  |
+
+### Transactions
+
+| Column             | Type      | Description                                  |
+|--------------------|-----------|----------------------------------------------|
+| id                 | UUID PK   | Transaction identifier                       |
+| card_id            | UUID FK   | Associated card                              |
+| type               | TEXT      | fund / redeem / payment                      |
+| redemption_method  | TEXT NULL | lightning / onchain                          |
+| tx_hash            | TEXT NULL | On-chain transaction hash                    |
+| payment_hash       | TEXT NULL | Lightning payment hash                       |
+| payment_preimage   | TEXT NULL | Lightning proof of payment                   |
+| lightning_invoice   | TEXT NULL | BOLT11 invoice string                        |
+| from_address       | TEXT NULL | Source address                               |
+| to_address         | TEXT NULL | Destination address                          |
+| btc_amount_sats    | BIGINT    | Amount in satoshis                           |
+| status             | TEXT      | pending / confirmed / failed                 |
+| confirmations      | INT       | On-chain confirmation count                  |
+| created_at         | TIMESTAMP | Transaction creation time                    |
+| broadcast_at       | TIMESTAMP | When transaction was broadcast               |
+| confirmed_at       | TIMESTAMP | When transaction was confirmed               |
+
+---
+
+## Redis Usage
+
+| Key Pattern              | Purpose                              | TTL  |
+|--------------------------|--------------------------------------|------|
+| `treasury:available_sats`| Cached treasury balance              | 10s  |
+| `treasury:lock`          | Distributed lock for treasury writes | 5s   |
+| `card:lock:{code}`       | Per-card lock (concurrent redemption)| 10s  |
+| `fund_card` stream       | Queue for card funding messages      | —    |
+| `monitor_tx` stream      | Queue for tx monitoring messages     | —    |
+
+---
+
+## Configuration
+
+All settings are in `config.toml` and can be overridden with environment variables:
+
+```toml
+[database]
+host = "localhost"
+port = "5432"
+user = "postgres"
+password = "postgres"
+db = "btcgifter"
+
+[redis]
+host = "localhost"
+port = "6379"
+
+[lnd]
+grpc_host = "localhost"
+port = "10009"
+tls_cert_path = "./lnd-creds/tls.cert"
+macaroon_path = "./lnd-creds/admin.macaroon"
+network = "testnet"
+payment_timeout_seconds = 30
+max_payment_fee_sats = 100
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Go 1.24+
+- Docker & Docker Compose
+- LND credentials (TLS cert + macaroon)
+
+### 1. Start Infrastructure
 
 ```bash
-# Application
-ENVIRONMENT=development        # or production
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-REDIS_DB=0
+docker compose up -d   # PostgreSQL, Redis, LND
 ```
 
----
-
-## Common Go Commands
+### 2. Copy LND Credentials (first time only)
 
 ```bash
-# Get help on any command
-go help [command]
+./scripts/copy-lnd-creds.sh
+```
 
-# List all dependencies
-go list -m all
+Then set `tls_cert_path` and `macaroon_path` in `config.toml`.
 
-# Update specific dependency
-go get -u github.com/redis/go-redis/v9
+### 3. Run the API Server
 
-# Remove unused dependencies
-go mod tidy
+```bash
+go run ./cmd/api
+```
 
-# Download all dependencies
-go mod download
+### 4. Run the Workers
+
+```bash
+# In separate terminals:
+go run ./cmd/worker/fund_card
+go run ./cmd/worker/monitor_tx
+```
+
+### 5. Run Tests
+
+```bash
+go test ./...                     # All tests
+go test ./internal/lnd/... -v     # LND tests (47 unit)
+go test ./internal/card/... -v    # Card service tests
 ```
 
 ---
 
-## Development Workflow
+## Development
 
-1. **Write code** in appropriate module
-2. **Format**: `go fmt ./...`
-3. **Check errors**: `go vet ./...`
-4. **Write tests**: Create `*_test.go` files
-5. **Run tests**: `go test ./... -v`
-6. **Run application**: `go run ./cmd/api`
+```bash
+go fmt ./...          # Format code
+go vet ./...          # Static analysis
+go test ./... -v      # Run all tests
+go build ./...        # Build everything
+```
 
----
+### Build Binaries
 
-## Useful Tips
-
-- Go automatically downloads dependencies on first `go run` or `go build`
-- Test files must end with `_test.go`
-- `internal/` packages are private to this project
-- `pkg/` packages can be imported by external projects
-- Use `-v` flag for verbose output in tests
-- Use `go test -run TestName` to run specific tests only
+```bash
+go build -o bin/api ./cmd/api
+go build -o bin/fund-worker ./cmd/worker/fund_card
+go build -o bin/monitor-worker ./cmd/worker/monitor_tx
+```

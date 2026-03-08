@@ -1,17 +1,23 @@
 package main
 
 import (
-	"btc-giftcard/config"
-	"btc-giftcard/internal/database"
-	"btc-giftcard/pkg/cache"
-	"btc-giftcard/pkg/logger"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
-	"time"
-
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
+	"time"
+
+	"btc-giftcard/config"
+	"btc-giftcard/internal/card"
+	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/lnd"
+	"btc-giftcard/pkg/cache"
+	"btc-giftcard/pkg/logger"
+	streams "btc-giftcard/pkg/queue"
 
 	"github.com/jinzhu/copier"
 	"go.uber.org/zap"
@@ -33,8 +39,8 @@ func run() error {
 	}
 	defer logger.Sync()
 
+	// Load configuration
 	_, filename, _, _ := runtime.Caller(0)
-
 	root := filepath.Dir(filename)
 	configPath := config.Path(root).Join("config.toml", "..", "..")
 
@@ -42,11 +48,7 @@ func run() error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	logger.Info("Server starting", zap.Int("port", 8080))
-	logger.Debug("Debug mode enabled")
-	logger.Warn("This is a warning", zap.String("reason", "testing"))
-
-	// Initialize cache with automatic field mapping
+	// Initialize Redis cache
 	var redisCfg cache.Config
 	if err := copier.Copy(&redisCfg, &Cfg.Redis); err != nil {
 		return fmt.Errorf("failed to copy cache config: %w", err)
@@ -56,30 +58,7 @@ func run() error {
 	}
 	defer cache.Close()
 
-	ctx := context.Background()
-
-	// Test Set
-	cache.Set(ctx, "test_key", "hello world", 5*time.Minute)
-
-	// Test Get
-	val, _ := cache.Get(ctx, "test_key")
-	logger.Info("Retrieved from cache", zap.String("value", val))
-
-	// Test SetNX (lock mechanism)
-	locked, _ := cache.SetNX(ctx, "lock:card:123", "processing", 30*time.Second)
-	logger.Info("Lock acquired", zap.Bool("success", locked))
-
-	// Try again - should fail
-	locked, _ = cache.SetNX(ctx, "lock:card:123", "processing", 30*time.Second)
-	logger.Info("Lock acquired again", zap.Bool("success", locked)) // false
-
-	// Test Incr (rate limiting)
-	count, _ := cache.Incr(ctx, "attempts:192.168.1.1")
-	logger.Info("Attempt count", zap.Int64("count", count))
-
-	logger.Info("Server started successfully")
-
-	// Initialize database with automatic field mapping
+	// Initialize database
 	var dbCfg database.Config
 	if err := copier.Copy(&dbCfg, &Cfg.Database); err != nil {
 		return fmt.Errorf("failed to copy database config: %w", err)
@@ -90,16 +69,81 @@ func run() error {
 	}
 	defer db.Close()
 
-	// Test database connection
+	ctx := context.Background()
+
+	// Verify database connection
 	if err := db.Ping(ctx); err != nil {
 		return fmt.Errorf("database ping failed: %w", err)
 	}
-	logger.Info("Database connected and verified successfully")
 
 	// Run migrations
 	if err := db.RunMigrations(); err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 
+	// Initialize LND client
+	var lndCfg lnd.Config
+	if err := copier.Copy(&lndCfg, &Cfg.LND); err != nil {
+		return fmt.Errorf("failed to copy LND config: %w", err)
+	}
+	lndClient, err := lnd.NewClient(lndCfg)
+	if err != nil {
+		return fmt.Errorf("failed to connect to LND: %w", err)
+	}
+	defer lndClient.Close()
+
+	// Verify LND connection
+	info, err := lndClient.GetInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get LND info: %w", err)
+	}
+	logger.Info("Connected to LND",
+		zap.String("alias", info.Alias),
+		zap.Bool("synced", info.SyncedToChain),
+		zap.Uint32("block_height", info.BlockHeight),
+	)
+
+	// Create repositories and services
+	cardRepo := database.NewCardRepository(db)
+	txRepo := database.NewTransactionRepository(db)
+	queue := streams.NewStreamQueue(cache.Client)
+	cardService := card.NewService(cardRepo, txRepo, lndCfg.Network, queue, lndClient)
+
+	// Build HTTP handler
+	handler := newHandler(cardService)
+
+	// Create HTTP server
+	// TODO: Make port configurable via config.toml [api] section
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      handler.routes(),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		logger.Info("API server starting", zap.String("addr", srv.Addr))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("Server failed", zap.Error(err))
+		}
+	}()
+
+	// Wait for shutdown signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigChan
+	logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+
+	// Graceful shutdown with 10s deadline
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("server shutdown failed: %w", err)
+	}
+
+	logger.Info("API server shut down gracefully")
 	return nil
 }
