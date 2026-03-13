@@ -50,4 +50,8 @@ type ApiConfig struct {
 		// Set to 0 for no limit (not recommended)
 		MaxPaymentFeeSats int64 `toml:"max_payment_fee_sats" env:"BTC_GIFTCARD_LND_MAX_FEE_SATS" env-default:"100"`
 	} `toml:"lnd"`
+
+	Cors struct {
+		Origin string `toml:"origin" env:"BTC_GIFTCARD_CORS_ORIGIN"`
+	} `toml:"cors"`
 }

@@ -8,71 +8,7 @@ import (
 
 	"btc-giftcard/internal/card"
 	"btc-giftcard/internal/database"
-	"btc-giftcard/pkg/logger"
-
-	"go.uber.org/zap"
 )
-
-// ============================================================================
-// Error mapping + response helpers
-// ============================================================================
-
-// errorStatusMap maps known service errors to HTTP status codes.
-// Looked up via errors.Is (not direct key access) so wrapped errors
-// like fmt.Errorf("...: %w", ErrCardNotFound) are matched correctly.
-var errorStatusMap = map[error]int{
-	card.ErrInvalidCurrency:   http.StatusBadRequest,
-	card.ErrInvalidFiatAmount: http.StatusBadRequest,
-	card.ErrInvalidPurchase:   http.StatusBadRequest,
-	card.ErrMissingEmail:      http.StatusBadRequest,
-	card.ErrCardNotFound:      http.StatusNotFound,
-	card.ErrCardNotActive:     http.StatusConflict,
-	card.ErrCardAlreadyUsed:   http.StatusConflict,
-	card.ErrInsufficientFunds: http.StatusUnprocessableEntity,
-	card.ErrInvalidMethod:     http.StatusBadRequest,
-	card.ErrInvalidAddress:    http.StatusBadRequest,
-	card.ErrLightningInvoice:  http.StatusBadRequest,
-}
-
-// APIError is the standard JSON error envelope returned by all endpoints.
-type APIError struct {
-	Code    int               `json:"code"`
-	Message string            `json:"message"`
-	Errors  map[string]string `json:"errors,omitempty"`
-}
-
-// Respond writes a JSON response with the given status code.
-func (h *handler) Respond(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-// RespondError writes a structured JSON error response.
-func (h *handler) RespondError(w http.ResponseWriter, status int, msg string, fieldErrors map[string]string) {
-	h.Respond(w, status, APIError{
-		Code:    status,
-		Message: msg,
-		Errors:  fieldErrors,
-	})
-}
-
-// handleError maps a service error to an HTTP error response.
-// Returns true if an error was handled (response was written), false if err is nil.
-func (h *handler) handleError(w http.ResponseWriter, err error) bool {
-	if err == nil {
-		return false
-	}
-	for target, status := range errorStatusMap {
-		if errors.Is(err, target) {
-			h.RespondError(w, status, err.Error(), nil)
-			return true
-		}
-	}
-	logger.Error("unexpected error", zap.Error(err))
-	h.RespondError(w, http.StatusInternalServerError, "internal server error", nil)
-	return true
-}
 
 // ============================================================================
 // Card handlers
@@ -102,16 +38,16 @@ func (h *handler) handleError(w http.ResponseWriter, err error) bool {
 func (h *handler) createCard(w http.ResponseWriter, r *http.Request) {
 	var req card.CreateCardRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.RespondError(w, http.StatusBadRequest, "invalid JSON", nil)
+		writeError(w, http.StatusBadRequest, "invalid JSON", nil)
 		return
 	}
 
 	resp, err := h.cardService.CreateCard(r.Context(), req)
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
 
-	h.Respond(w, http.StatusCreated, resp)
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // redeemCard handles POST /api/cards/{code}/redeem
@@ -146,17 +82,17 @@ func (h *handler) createCard(w http.ResponseWriter, r *http.Request) {
 func (h *handler) redeemCard(w http.ResponseWriter, r *http.Request) {
 	var req card.RedeemCardRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.RespondError(w, http.StatusBadRequest, "invalid JSON", nil)
+		writeError(w, http.StatusBadRequest, "invalid JSON", nil)
 		return
 	}
 	req.Code = r.PathValue("code")
 
 	resp, err := h.cardService.RedeemCard(r.Context(), req)
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
 
-	h.Respond(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // getCard handles GET /api/cards/{code}
@@ -175,10 +111,10 @@ func (h *handler) redeemCard(w http.ResponseWriter, r *http.Request) {
 //	}
 func (h *handler) getCard(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.cardService.GetCardByCode(r.Context(), r.PathValue("code"))
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
-	h.Respond(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // getCardBalance handles GET /api/cards/{code}/balance
@@ -194,16 +130,16 @@ func (h *handler) getCard(w http.ResponseWriter, r *http.Request) {
 func (h *handler) getCardBalance(w http.ResponseWriter, r *http.Request) {
 	// GetCardBalance takes a cardID, so resolve code → card first.
 	c, err := h.cardService.GetCardByCode(r.Context(), r.PathValue("code"))
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
 
 	sats, err := h.cardService.GetCardBalance(r.Context(), c.ID)
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
 
-	h.Respond(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"btc_amount_sats": sats,
 		"btc_amount":      fmt.Sprintf("%.8f", float64(sats)/1e8),
 	})
@@ -221,17 +157,17 @@ func (h *handler) validateCard(w http.ResponseWriter, r *http.Request) {
 	status, err := h.cardService.ValidateCardCode(r.Context(), r.PathValue("code"))
 	if err != nil {
 		if errors.Is(err, card.ErrCardNotFound) {
-			h.Respond(w, http.StatusOK, map[string]any{
+			writeJSON(w, http.StatusOK, map[string]any{
 				"valid":  false,
 				"status": "",
 			})
 			return
 		}
-		h.handleError(w, err)
+		handleError(w, err)
 		return
 	}
 
-	h.Respond(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"valid":  status == database.Active,
 		"status": status,
 	})
@@ -251,11 +187,11 @@ func (h *handler) validateCard(w http.ResponseWriter, r *http.Request) {
 //	}
 func (h *handler) getTreasuryBalance(w http.ResponseWriter, r *http.Request) {
 	sats, err := h.cardService.GetTreasuryAvailableBalance(r.Context())
-	if h.handleError(w, err) {
+	if handleError(w, err) {
 		return
 	}
 
-	h.Respond(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"available_sats": sats,
 		"available_btc":  fmt.Sprintf("%.8f", float64(sats)/1e8),
 	})
@@ -271,5 +207,5 @@ func (h *handler) getTreasuryBalance(w http.ResponseWriter, r *http.Request) {
 //
 //	{"status": "ok"}
 func (h *handler) healthCheck(w http.ResponseWriter, r *http.Request) {
-	h.Respond(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

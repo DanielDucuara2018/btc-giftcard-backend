@@ -17,6 +17,9 @@ func (p Path) ToString() string {
 	return string(p)
 }
 
+// parses the configuration file first, then reads
+// environment variables and overwrites the file
+// values with any matching env vars it finds
 func Load(path Path, cfg any) error {
 	err := cleanenv.ReadConfig(path.ToString(), cfg)
 	return err

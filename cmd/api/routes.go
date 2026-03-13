@@ -35,8 +35,15 @@ func (h *handler) registerTreasuryRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /treasury/balance", h.getTreasuryBalance)
 }
 
-// routes builds the HTTP router with all API routes under /api/ and
-// the health check at the root.
+// routes builds the HTTP router and wraps it with the middleware chain.
+//
+// Middleware order (outermost → innermost):
+//
+//  1. loggingMiddleware  — logs after the request completes (captures real status + duration)
+//  2. recoveryMiddleware — catches panics, writes 500 before logging records it
+//  3. corsMiddleware     — sets CORS headers, short-circuits OPTIONS preflights
+//
+// Pending: requestIDMiddleware, rateLimitMiddleware (see middleware.go TODOs).
 func (h *handler) routes() http.Handler {
 	root := http.NewServeMux()
 
@@ -47,5 +54,5 @@ func (h *handler) routes() http.Handler {
 	root.Handle("/api/", http.StripPrefix("/api", apiV1))
 	root.HandleFunc("GET /health", h.healthCheck)
 
-	return root
+	return loggingMiddleware(recoveryMiddleware(corsMiddleware(root)))
 }
