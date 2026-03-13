@@ -73,6 +73,7 @@ const (
 //
 // Workers call: FundCard (fund_card worker).
 type Service struct {
+	db        *database.DB
 	cardRepo  *database.CardRepository
 	txRepo    *database.TransactionRepository
 	network   string // "testnet" or "mainnet"
@@ -82,6 +83,7 @@ type Service struct {
 
 // NewService creates a new card service instance.
 func NewService(
+	db *database.DB,
 	cardRepo *database.CardRepository,
 	txRepo *database.TransactionRepository,
 	network string,
@@ -89,6 +91,7 @@ func NewService(
 	lndClient *lnd.Client,
 ) *Service {
 	return &Service{
+		db:        db,
 		cardRepo:  cardRepo,
 		txRepo:    txRepo,
 		network:   network,
@@ -299,17 +302,42 @@ func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*Redee
 		return nil, err
 	}
 
-	// Step 5: Create transaction record
+	// Steps 5+6: Record transaction and update card balance atomically.
+	// These two writes must succeed or fail together. We retry with backoff
+	// because the LND payment (Step 4) is irreversible — if the DB write fails
+	// we must keep trying rather than silently lose the payment record.
+	// Idempotency: UNIQUE constraints on payment_hash / tx_hash prevent duplicate
+	// records if a successful commit acknowledgment was lost (network blip).
 	now := time.Now().UTC()
-	tx, err := s.recordRedemptionTransaction(ctx, card.ID, req, payResult, now)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		redeemedTx       *database.Transaction
+		remainingBalance int64
+	)
 
-	// Step 6: Update card balance
-	remainingBalance, err := s.updateCardBalance(ctx, card.ID, card.BTCAmountSats, req.AmountSats)
-	if err != nil {
-		return nil, err
+	dbErr := retryWithBackoff(ctx, 3, 100*time.Millisecond, func() error {
+		return s.db.RunInTx(ctx, func(q database.Querier) error {
+			var err error
+			// Fresh UUID per attempt avoids PK collision if a previous attempt
+			// was rolled back after a partial write.
+			redeemedTx, err = s.recordRedemptionTransaction(ctx, s.txRepo.WithTx(q), card.ID, req, payResult, now)
+			if err != nil {
+				return err
+			}
+			remainingBalance, err = s.updateCardBalance(ctx, s.cardRepo.WithTx(q), card.ID, card.BTCAmountSats, req.AmountSats)
+			return err
+		})
+	})
+
+	if dbErr != nil {
+		logger.Error("CRITICAL: payment sent but DB write failed after retries — manual reconciliation required",
+			zap.String("card_id", card.ID),
+			zap.String("card_code", req.Code),
+			zap.Stringp("payment_hash", payResult.PaymentHash),
+			zap.Stringp("tx_hash", payResult.TxHash),
+			zap.Int64("amount_sats", req.AmountSats),
+			zap.Error(dbErr),
+		)
+		return nil, fmt.Errorf("payment sent but failed to record — contact support with card code %s", req.Code)
 	}
 
 	// Step 7: Invalidate treasury cache (balance changed)
@@ -317,25 +345,25 @@ func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*Redee
 
 	// Step 8: Publish monitor message for on-chain transactions
 	if req.Method == OnChain && payResult.TxHash != nil {
-		s.publishMonitorTransaction(ctx, card.ID, tx.ID, *payResult.TxHash, req.AmountSats, req.DestinationAddress)
+		s.publishMonitorTransaction(ctx, card.ID, redeemedTx.ID, *payResult.TxHash, req.AmountSats, req.DestinationAddress)
 	}
 
 	logger.Info("Card redeemed successfully",
 		zap.String("card_id", card.ID),
-		zap.String("tx_id", tx.ID),
+		zap.String("tx_id", redeemedTx.ID),
 		zap.String("method", string(req.Method)),
 		zap.Int64("amount_sats", req.AmountSats),
 		zap.Int64("remaining_sats", remainingBalance),
 	)
 
 	return &RedeemCardResponse{
-		TransactionID:    tx.ID,
+		TransactionID:    redeemedTx.ID,
 		Method:           string(req.Method),
 		TxHash:           payResult.TxHash,
 		PaymentHash:      payResult.PaymentHash,
 		BTCAmountSats:    req.AmountSats,
 		RemainingBalance: remainingBalance,
-		Status:           tx.Status,
+		Status:           redeemedTx.Status,
 	}, nil
 }
 
@@ -481,11 +509,36 @@ func (s *Service) FundCard(ctx context.Context, cardID string, satoshis int64) e
 		return fmt.Errorf("treasury insufficient: need %d sats, have %d available", satoshis, available)
 	}
 
-	// Step 5: Activate card (reserve the balance — this IS the funding)
+	// Steps 5+6: Activate card and record fund transaction atomically.
+	// Both writes must succeed or fail together — a card that is Active but has
+	// no Fund transaction record corrupts treasury balance computations.
 	now := time.Now().UTC()
-	if err := s.cardRepo.Update(ctx, card.ID, database.Active, &satoshis, &now, nil); err != nil {
+
+	dbErr := retryWithBackoff(ctx, 3, 100*time.Millisecond, func() error {
+		return s.db.RunInTx(ctx, func(q database.Querier) error {
+			if err := s.cardRepo.WithTx(q).Update(ctx, card.ID, database.Active, &satoshis, &now, nil); err != nil {
+				return fmt.Errorf("failed to activate card: %w", err)
+			}
+			fundTx := &database.Transaction{
+				ID:            uuid.New().String(), // fresh UUID per attempt
+				CardID:        card.ID,
+				Type:          database.Fund,
+				BTCAmountSats: satoshis,
+				Status:        database.Confirmed,
+				Confirmations: 0,
+				CreatedAt:     now,
+				ConfirmedAt:   &now,
+			}
+			if err := s.txRepo.WithTx(q).Create(ctx, fundTx); err != nil {
+				return fmt.Errorf("failed to create fund transaction: %w", err)
+			}
+			return nil
+		})
+	})
+
+	if dbErr != nil {
 		s.revertCardToCreated(ctx, card.ID)
-		return fmt.Errorf("failed to activate card: %w", err)
+		return fmt.Errorf("failed to activate card atomically: %w", dbErr)
 	}
 
 	logger.Info("Card funded (balance reserved)",
@@ -493,24 +546,6 @@ func (s *Service) FundCard(ctx context.Context, cardID string, satoshis int64) e
 		zap.Int64("satoshis", satoshis),
 		zap.Int64("treasury_available", available-satoshis),
 	)
-
-	// Step 6: Create Fund transaction record (accounting only — no blockchain tx)
-	tx := &database.Transaction{
-		ID:            uuid.New().String(),
-		CardID:        card.ID,
-		Type:          database.Fund,
-		BTCAmountSats: satoshis,
-		Status:        database.Confirmed,
-		Confirmations: 0,
-		CreatedAt:     now,
-		ConfirmedAt:   &now,
-	}
-	if err := s.txRepo.Create(ctx, tx); err != nil {
-		logger.Error("Failed to create fund transaction (card is active but tx not recorded)",
-			zap.String("card_id", card.ID),
-			zap.Error(err),
-		)
-	}
 
 	// Step 7: Invalidate treasury cache (balance changed)
 	s.InvalidateTreasuryCache(ctx)
@@ -738,8 +773,11 @@ func (s *Service) executeOnChainPayment(ctx context.Context, address string, amo
 }
 
 // recordRedemptionTransaction creates a Transaction record for the redemption.
+// txRepo is passed explicitly so callers can supply a transaction-scoped repo
+// (via TransactionRepository.WithTx) for atomic writes.
 func (s *Service) recordRedemptionTransaction(
 	ctx context.Context,
+	txRepo *database.TransactionRepository,
 	cardID string,
 	req RedeemCardRequest,
 	pay *paymentOutput,
@@ -764,7 +802,7 @@ func (s *Service) recordRedemptionTransaction(
 		ConfirmedAt:      pay.ConfirmedAt,
 	}
 
-	if err := s.txRepo.Create(ctx, tx); err != nil {
+	if err := txRepo.Create(ctx, tx); err != nil {
 		return nil, fmt.Errorf("failed to create transaction: %w", err)
 	}
 
@@ -772,7 +810,9 @@ func (s *Service) recordRedemptionTransaction(
 }
 
 // updateCardBalance deducts the spend amount and marks the card redeemed if balance is zero.
-func (s *Service) updateCardBalance(ctx context.Context, cardID string, currentBalance, spendAmount int64) (int64, error) {
+// cardRepo is passed explicitly so callers can supply a transaction-scoped repo
+// (via CardRepository.WithTx) for atomic writes.
+func (s *Service) updateCardBalance(ctx context.Context, cardRepo *database.CardRepository, cardID string, currentBalance, spendAmount int64) (int64, error) {
 	remaining := currentBalance - spendAmount
 	status := database.Active
 	var redeemedAt *time.Time
@@ -783,11 +823,32 @@ func (s *Service) updateCardBalance(ctx context.Context, cardID string, currentB
 		redeemedAt = &t
 	}
 
-	if err := s.cardRepo.Update(ctx, cardID, status, &remaining, nil, redeemedAt); err != nil {
+	if err := cardRepo.Update(ctx, cardID, status, &remaining, nil, redeemedAt); err != nil {
 		return 0, fmt.Errorf("failed to update card: %w", err)
 	}
 
 	return remaining, nil
+}
+
+// retryWithBackoff calls fn up to maxAttempts times, doubling the wait after each
+// failure. Returns the last error if all attempts fail or ctx is cancelled.
+func retryWithBackoff(ctx context.Context, maxAttempts int, initialDelay time.Duration, fn func() error) error {
+	var lastErr error
+	delay := initialDelay
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+			delay *= 2
+		}
+		if lastErr = fn(); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
 }
 
 // publishMonitorTransaction publishes a MonitorTransactionMessage so a worker

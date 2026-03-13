@@ -130,6 +130,25 @@ func (db *DB) RunMigrations() error {
 	return nil
 }
 
+// RunInTx executes fn inside a single DB transaction.
+// fn receives a Querier scoped to the transaction — pass it to WithTx on any
+// repository to make that repository use the same connection.
+// If fn returns an error the transaction is rolled back.
+// If fn returns nil the transaction is committed.
+func (db *DB) RunInTx(ctx context.Context, fn func(q Querier) error) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op if Commit already succeeded
+
+	if err := fn(tx); err != nil {
+		return err // Rollback fires via defer
+	}
+
+	return tx.Commit(ctx)
+}
+
 // Close gracefully shuts down the connection pool
 func (db *DB) Close() {
 	if db.pool != nil {

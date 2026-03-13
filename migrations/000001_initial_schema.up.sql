@@ -26,8 +26,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     card_id UUID NOT NULL,
     type transaction_type DEFAULT 'fund' NOT NULL,
     redemption_method TEXT NULL,                 -- 'lightning' or 'onchain' (per transaction)
-    tx_hash VARCHAR(64) UNIQUE NULL,             -- Bitcoin on-chain tx hash (NULL for Lightning)
-    payment_hash VARCHAR(64) UNIQUE NULL,        -- Lightning payment hash (NULL for on-chain)
+    tx_hash VARCHAR(64) NULL,                    -- Bitcoin on-chain tx hash (NULL for Lightning)
+    payment_hash VARCHAR(64) NULL,               -- Lightning payment hash (NULL for on-chain)
     payment_preimage VARCHAR(64) NULL,           -- Lightning proof of payment (set on success)
     lightning_invoice TEXT NULL,                  -- BOLT11 invoice string (NULL for on-chain)
     from_address VARCHAR(100) NULL,              -- Source Bitcoin address (on-chain)
@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     broadcast_at TIMESTAMPTZ NULL,               -- When transaction was sent to blockchain
     confirmed_at TIMESTAMPTZ NULL,               -- When transaction received confirmations
     
-    CONSTRAINT fk_transactions_card FOREIGN KEY (card_id) REFERENCES cards (id) ON DELETE CASCADE
+    CONSTRAINT fk_transactions_card FOREIGN KEY (card_id) REFERENCES cards (id) ON DELETE CASCADE,
+    -- Idempotency guards: if a post-payment DB write is retried after a lost commit
+    -- acknowledgment, these constraints prevent duplicate records from being inserted.
+    CONSTRAINT uq_transactions_tx_hash UNIQUE (tx_hash),
+    CONSTRAINT uq_transactions_payment_hash UNIQUE (payment_hash)
 );
 
 -- Indexes for performance

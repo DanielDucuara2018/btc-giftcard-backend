@@ -194,7 +194,46 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
   - Cache price for 30 seconds (avoid hitting rate limits)
   - **Estimated effort:** 3-4 hours
 
-### 1.4 Testing & Quality Assurance
+### 1.4 Post-Payment Reliability
+
+**Priority:** HIGH  
+**Context:** LND payments (`RedeemCard` Step 4) are irreversible and external. A DB failure
+after payment creates a **ghost payment** — money sent, no DB record, card balance unchanged.
+Three layers of defence are implemented or planned:
+
+- [x] **Atomic DB writes with retry** ✅ Done
+  - `RedeemCard` Steps 5+6 (INSERT transaction + UPDATE card balance) wrapped in `RunInTx`
+  - `retryWithBackoff(3 attempts, 100ms → 200ms → 400ms)` for transient DB errors
+  - Idempotency: `UNIQUE` constraints on `payment_hash` and `tx_hash` prevent duplicate records
+    if a previously successful commit acknowledgment was lost (network blip)
+  - `FundCard` Steps 5+6 (UPDATE card Active + INSERT fund record) also wrapped atomically
+  - `ErrTransactionExists` returned by `TransactionRepository.Create` on unique violation
+  - `CRITICAL` log emitted with `card_id`, `payment_hash`, `tx_hash`, `amount_sats` if all retries fail
+
+- [ ] **Reconciliation worker — LND ↔ DB cross-check**
+  - Create `cmd/worker/reconcile/main.go` + `internal/card/reconcile.go`
+  - Run on schedule (every 5 minutes)
+  - **Lightning path:** query `lndClient.ListPayments(creationDateStart=lastRunTime)`
+    - For each LND payment, look up DB by `payment_hash`
+    - Ghost detected → INSERT transaction record + decrement `btc_amount_sats` on card
+  - **On-chain path:** cross-check `tx_hash` via LND wallet transaction list
+  - Emit `RECONCILE_GHOST_PAYMENT` structured log + alert on every ghost found
+  - Idempotent: safe to run multiple times (duplicate writes hit unique constraint cleanly)
+  - **Estimated effort:** 8-10 hours
+
+- [ ] **PagerDuty / Opsgenie alerting on CRITICAL log**
+  - Wire zap logger to fire a PagerDuty Events API v2 call on any `CRITICAL`-prefixed message
+  - Triggers on: `"CRITICAL: payment sent but DB write failed after retries"`
+  - PagerDuty incident payload: `card_id`, `card_code`, `payment_hash`/`tx_hash`, `amount_sats`
+  - Include runbook link pointing to reconciliation procedure in incident details
+  - Resolves automatically when reconciliation worker confirms the ghost is fixed
+  - **Options:** PagerDuty Events API v2 (`POST events.pagerduty.com/v2/enqueue`),
+    Opsgenie (`POST api.opsgenie.com/v1/alerts`)
+  - **Estimated effort:** 2-3 hours
+
+---
+
+### 1.5 Testing & Quality Assurance
 
 - [ ] **Integration tests for full card lifecycle**
   - Test: Payment received → Card funded → Transaction confirmed

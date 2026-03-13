@@ -98,7 +98,7 @@ func run() error {
 	cardRepo := database.NewCardRepository(db)
 	txRepo := database.NewTransactionRepository(db)
 	queue := streams.NewStreamQueue(cache.Client)
-	cardService := card.NewService(cardRepo, txRepo, Cfg.LND.Network, queue, lndClient)
+	cardService := card.NewService(db, cardRepo, txRepo, Cfg.LND.Network, queue, lndClient)
 	handler := newMessageHandler(cardService, provider)
 
 	if err := startConsumer(ctx, queue, handler); err != nil {

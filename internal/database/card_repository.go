@@ -8,7 +8,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -20,7 +19,7 @@ var (
 
 // CardRepository handles all database operations for cards
 type CardRepository struct {
-	db *pgxpool.Pool
+	db Querier
 }
 
 // NewCardRepository creates a new card repository instance
@@ -228,6 +227,13 @@ func (r *CardRepository) ListByUserID(ctx context.Context, userID string) ([]*Ca
 	}
 
 	return cards, nil
+}
+
+// WithTx returns a shallow copy of the repository bound to the given
+// transaction. Use this inside DB.RunInTx to make all queries on the copy
+// participate in the same transaction.
+func (r *CardRepository) WithTx(q Querier) *CardRepository {
+	return &CardRepository{db: q}
 }
 
 // GetTotalReservedBalance returns the sum of btc_amount_sats for all cards

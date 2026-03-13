@@ -7,17 +7,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
 	// ErrTransactionNotFound is returned when a transaction is not found in the database
 	ErrTransactionNotFound = errors.New("transaction not found")
+	// ErrTransactionExists is returned when a transaction with the same payment_hash
+	// or tx_hash already exists. This typically means the DB write succeeded on a
+	// previous attempt whose commit acknowledgment was lost (network blip).
+	ErrTransactionExists = errors.New("transaction already exists")
 )
 
 // TransactionRepository handles all database operations for transactions
 type TransactionRepository struct {
-	db *pgxpool.Pool
+	db Querier
 }
 
 // NewTransactionRepository creates a new transaction repository instance
@@ -72,10 +76,23 @@ func (r *TransactionRepository) Create(ctx context.Context, tx *Transaction) err
 	)
 
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// Unique violation on payment_hash or tx_hash — the transaction was
+			// already recorded (commit succeeded but acknowledgment was lost).
+			return ErrTransactionExists
+		}
 		return fmt.Errorf("failed to create transaction: %w", err)
 	}
 
 	return nil
+}
+
+// WithTx returns a shallow copy of the repository bound to the given
+// transaction. Use this inside DB.RunInTx to make all queries on the copy
+// participate in the same transaction.
+func (r *TransactionRepository) WithTx(q Querier) *TransactionRepository {
+	return &TransactionRepository{db: q}
 }
 
 // GetByID retrieves a transaction by its UUID.
