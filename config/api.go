@@ -51,7 +51,7 @@ type ApiConfig struct {
 		MaxPaymentFeeSats int64 `toml:"max_payment_fee_sats" env:"BTC_GIFTCARD_LND_MAX_FEE_SATS" env-default:"100"`
 	} `toml:"lnd"`
 
-	Cors struct {
-		Origin string `toml:"origin" env:"BTC_GIFTCARD_CORS_ORIGIN"`
-	} `toml:"cors"`
+	Api struct {
+		CorsOrigin string `toml:"cors_origin" env:"BTC_GIFTCARD_CORS_ORIGIN"`
+	} `toml:"api"`
 }

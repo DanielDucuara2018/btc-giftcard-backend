@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,18 @@ import (
 	"btc-giftcard/internal/card"
 	"btc-giftcard/internal/database"
 )
+
+// cardServicer is the interface satisfied by *card.Service.
+// Using an interface here decouples HTTP handlers from the concrete service,
+// enabling unit testing with mock implementations.
+type cardServicer interface {
+	CreateCard(ctx context.Context, req card.CreateCardRequest) (*card.CreateCardResponse, error)
+	RedeemCard(ctx context.Context, req card.RedeemCardRequest) (*card.RedeemCardResponse, error)
+	GetCardByCode(ctx context.Context, code string) (*database.Card, error)
+	GetCardBalance(ctx context.Context, cardID string) (int64, error)
+	ValidateCardCode(ctx context.Context, code string) (database.CardStatus, error)
+	GetTreasuryAvailableBalance(ctx context.Context) (int64, error)
+}
 
 // ============================================================================
 // Card handlers

@@ -3,6 +3,7 @@ package cache
 import (
 	"btc-giftcard/pkg/logger"
 	"context"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -107,6 +108,9 @@ func SetNX(ctx context.Context, key string, value interface{}, expiration time.D
 // If the key doesn't exist, it's set to 0 before performing the increment
 // Returns the value after increment
 func Incr(ctx context.Context, key string) (int64, error) {
+	if Client == nil {
+		return 0, errors.New("redis client not initialized")
+	}
 	res, err := Client.Incr(ctx, key).Result()
 	if err != nil {
 		logger.Error("Failed to increment key in Redis", zap.String("key", key), zap.Error(err))

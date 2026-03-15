@@ -132,6 +132,12 @@ type LightningClient interface {
 	//   - Return NodeInfo with synced_to_chain, synced_to_graph, block_height
 	GetInfo(ctx context.Context) (*NodeInfo, error)
 
+	// GetTransaction queries LND for the confirmation status of an on-chain
+	// transaction. Used by the monitor_tx worker to track confirmation progress.
+	//   - Call lnrpc.Lightning.GetTransactions() and search for txHash in results
+	//   - Return Found=false when the tx is not in LND's wallet history
+	GetTransaction(ctx context.Context, txHash string) (*OnChainTxStatus, error)
+
 	// Close closes the underlying gRPC connection.
 	Close() error
 }
@@ -186,6 +192,16 @@ type NodeInfo struct {
 	SyncedToGraph bool
 	BlockHeight   uint32
 	NumChannels   uint32
+}
+
+// OnChainTxStatus holds the confirmation status of an on-chain transaction.
+type OnChainTxStatus struct {
+	TxHash           string
+	NumConfirmations int32
+	BlockHeight      int32
+	BlockHash        string
+	Amount           int64
+	Found            bool // false when LND has no record of this tx in its wallet
 }
 
 // ============================================================================

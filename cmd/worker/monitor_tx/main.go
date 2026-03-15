@@ -32,6 +32,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -233,6 +234,17 @@ func awaitShutdown(cancel context.CancelFunc) {
 // Message Processing
 // ============================================================================
 
+const (
+	// targetConfirmations is the number of block confirmations required before
+	// a transaction is considered fully settled (~1 hour on Bitcoin mainnet).
+	targetConfirmations = 6
+
+	// monitorTimeout is how long we wait for a transaction to confirm before
+	// marking it as failed. Transactions stuck in mempool beyond 24h are
+	// typically evicted by nodes and will never confirm.
+	monitorTimeout = 24 * time.Hour
+)
+
 // messageHandler holds the dependencies for processing monitor_tx messages.
 type messageHandler struct {
 	txRepo    *database.TransactionRepository
@@ -254,54 +266,138 @@ func newMessageHandler(
 
 // processMessage handles a single MonitorTransactionMessage from the queue.
 //
-// Implementation steps:
-//
-//  1. Deserialize and validate the message using messages.FromJSONMonitorTx(data)
-//
-//  2. Look up the transaction in the database by tx_hash:
-//     - Call h.txRepo.GetByTxHash(ctx, msg.TxHash)
-//     - If not found, log warning and return nil (ACK, don't retry)
-//     - If already "confirmed" or "failed", return nil (idempotent)
-//
-//  3. Query the transaction status from LND or a blockchain API:
-//     - Option A: Use LND's GetTransactions RPC to find our tx in the list
-//     - Option B: Query a public API (mempool.space, blockstream.info) as fallback
-//     - Extract: confirmation count, block hash, block height
-//
-//  4. Evaluate confirmation status:
-//     a) If confirmations >= targetConfirmations (6):
-//     - Update transaction: status="confirmed", confirmations=N, confirmed_at=now()
-//     - Log success with card_id, tx_hash, confirmations
-//     - Return nil (ACK)
-//     b) If confirmations > 0 but < target:
-//     - Update transaction: confirmations=N (partial progress)
-//     - Re-publish the message to "monitor_tx" stream for another check later
-//     - Log progress: "tx has X/6 confirmations"
-//     - Return nil (ACK this message — a new one was published)
-//     c) If confirmations == 0 (still in mempool):
-//     - Check how long since broadcast_at (from the transaction record)
-//     - If < 24 hours: re-publish for later check
-//     - If > 24 hours: mark as "failed", log alert
-//     - Return nil
-//     d) If transaction not found on-chain at all:
-//     - If broadcast_at < 1 hour ago: re-publish (may still be propagating)
-//     - If broadcast_at > 24 hours ago: mark as "failed", log alert
-//     - Return nil
-//
-//  5. For re-publishing: use a simple delay mechanism
-//     - Publish a new MonitorTransactionMessage to "monitor_tx"
-//     - The consumer will pick it up on the next cycle
-//     - Consider adding a "check_count" or "first_seen" field to prevent infinite loops
+// It queries LND for the on-chain confirmation status of the broadcast
+// transaction and either:
+//   - Marks it confirmed (>= 6 confirmations)
+//   - Updates the confirmation count and re-publishes for another check cycle
+//   - Marks it failed after 24 h with no confirmations
 func (h *messageHandler) processMessage(ctx context.Context, messageID string, data []byte) error {
-	// TODO: Implement — see steps above.
-	//
-	// Placeholder to keep imports valid:
-	_ = messages.FromJSONMonitorTx
-	_ = h.txRepo
-	_ = h.lndClient
-	_ = h.queue
+	// Step 1: Deserialize and validate the message.
+	msg, err := messages.FromJSONMonitorTx(data)
+	if err != nil {
+		// Malformed messages cannot be retried — ACK them so they don't
+		// block the consumer group.
+		logger.Error("Failed to deserialize MonitorTransactionMessage — ACKing",
+			zap.String("messageID", messageID),
+			zap.Error(err),
+		)
+		return nil
+	}
 
-	logger.Info("Processing monitor_tx message", zap.String("messageID", messageID))
+	// Step 2: Look up the transaction in the database.
+	tx, err := h.txRepo.GetByTxHash(ctx, msg.TxHash)
+	if err != nil {
+		if errors.Is(err, database.ErrTransactionNotFound) {
+			logger.Warn("Transaction not found in DB — ACKing",
+				zap.String("tx_hash", msg.TxHash),
+				zap.String("card_id", msg.CardID),
+			)
+			return nil // ACK: can't monitor what we don't know about
+		}
+		// Transient DB error — NACK so the consumer retries.
+		return fmt.Errorf("failed to fetch transaction %s: %w", msg.TxHash, err)
+	}
 
-	panic("processMessage not implemented")
+	// Step 3: Idempotency — skip already-terminal transactions.
+	if tx.Status == database.Confirmed || tx.Status == database.Failed {
+		logger.Info("Transaction already in terminal state — skipping",
+			zap.String("tx_hash", msg.TxHash),
+			zap.String("status", string(tx.Status)),
+		)
+		return nil
+	}
+
+	// Step 4: Check for timeout (24 h since broadcast).
+	if tx.BroadcastAt != nil && time.Since(*tx.BroadcastAt) > monitorTimeout {
+		if err := h.txRepo.Update(ctx, tx.ID, database.Failed, 0, nil, nil); err != nil {
+			return fmt.Errorf("failed to mark timed-out transaction as failed: %w", err)
+		}
+		logger.Error("Transaction timed out — marked failed",
+			zap.String("tx_hash", msg.TxHash),
+			zap.String("tx_id", tx.ID),
+			zap.Time("broadcast_at", *tx.BroadcastAt),
+		)
+		return nil
+	}
+
+	// Step 5: Query LND for the current on-chain status.
+	onchainStatus, err := h.lndClient.GetTransaction(ctx, msg.TxHash)
+	if err != nil {
+		// LND is temporarily unavailable — re-publish and ACK so the
+		// consumer group isn't blocked on a single failing message.
+		logger.Warn("LND query failed — re-publishing for retry",
+			zap.String("tx_hash", msg.TxHash),
+			zap.Error(err),
+		)
+		h.republish(ctx, msg)
+		return nil
+	}
+
+	// Step 6: Transaction not yet visible in LND's wallet.
+	if !onchainStatus.Found {
+		logger.Info("Transaction not yet visible in LND wallet — re-publishing",
+			zap.String("tx_hash", msg.TxHash),
+		)
+		h.republish(ctx, msg)
+		return nil
+	}
+
+	confirmations := int(onchainStatus.NumConfirmations)
+	logger.Info("Transaction confirmation update",
+		zap.String("tx_hash", msg.TxHash),
+		zap.Int("confirmations", confirmations),
+		zap.Int("required", targetConfirmations),
+	)
+
+	// Step 7a: Fully confirmed.
+	if confirmations >= targetConfirmations {
+		now := time.Now().UTC()
+		if err := h.txRepo.Update(ctx, tx.ID, database.Confirmed, confirmations, nil, &now); err != nil {
+			return fmt.Errorf("failed to mark transaction as confirmed: %w", err)
+		}
+		logger.Info("Transaction confirmed",
+			zap.String("tx_hash", msg.TxHash),
+			zap.String("tx_id", tx.ID),
+			zap.Int("confirmations", confirmations),
+		)
+		return nil
+	}
+
+	// Step 7b: Partially confirmed or still in mempool — update progress and
+	// re-publish for another poll cycle.
+	if err := h.txRepo.Update(ctx, tx.ID, database.Pending, confirmations, nil, nil); err != nil {
+		// Non-fatal: log and continue to re-publish.
+		logger.Warn("Failed to update confirmation count",
+			zap.String("tx_hash", msg.TxHash),
+			zap.Int("confirmations", confirmations),
+			zap.Error(err),
+		)
+	}
+
+	h.republish(ctx, msg)
+	logger.Info("Transaction not yet confirmed — re-queued",
+		zap.String("tx_hash", msg.TxHash),
+		zap.Int("confirmations", confirmations),
+	)
+	return nil
+}
+
+// republish re-publishes a MonitorTransactionMessage to the monitor_tx stream
+// for the next poll cycle. Errors are logged but not returned — the original
+// message is ACKed regardless to prevent consumer group stalls.
+func (h *messageHandler) republish(ctx context.Context, msg *messages.MonitorTransactionMessage) {
+	data, err := msg.ToJSON()
+	if err != nil {
+		logger.Error("Failed to serialize message for republish",
+			zap.String("tx_hash", msg.TxHash),
+			zap.Error(err),
+		)
+		return
+	}
+	if _, err := h.queue.Publish(ctx, "monitor_tx", data); err != nil {
+		logger.Error("Failed to re-publish monitor_tx message",
+			zap.String("tx_hash", msg.TxHash),
+			zap.Error(err),
+		)
+	}
 }

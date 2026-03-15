@@ -1,15 +1,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"time"
 
 	"btc-giftcard/internal/card"
+	"btc-giftcard/pkg/cache"
 	"btc-giftcard/pkg/logger"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+)
+
+const (
+	requestIDKey    = "request_id"
+	rateLimitPrefix = "ratelimit:"
+	rateLimitValue  = 100
+	rateLimitTTL    = 60 * time.Second
 )
 
 // ============================================================================
@@ -43,37 +54,36 @@ func (rw *responseWriter) WriteHeader(status int) {
 
 // loggingMiddleware logs every request AFTER it completes so it captures
 // the actual status code and total duration (including time spent in
-// downstream middleware). Must be the outermost middleware in the chain.
+// downstream middleware). Must sit inside requestIDMiddleware so the
+// request ID is already in context when the log line is written.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := newResponseWriter(w)
 		next.ServeHTTP(rw, r)
+		reqID, _ := r.Context().Value(requestIDKey).(string)
 		logger.Info("request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
 			zap.Int("status", rw.status),
 			zap.Duration("duration", time.Since(start)),
+			zap.String("request_id", reqID),
 		)
 	})
 }
 
 // recoveryMiddleware catches panics in handlers and returns a 500 JSON
 // response instead of crashing the process. Must be placed inside
-// loggingMiddleware so the 500 is captured in the access log.
-//
-// TODO: Once requestIDMiddleware is added, include the request ID in the
-// panic log for easier incident correlation:
-//
-//	logger.Error("panic", zap.Any("panic", rec), zap.Stack("stack"),
-//	    zap.String("request_id", r.Context().Value(requestIDKey).(string)))
+// loggingMiddleware so the 500 status is captured in the access log.
 func recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				reqID, _ := r.Context().Value(requestIDKey).(string)
 				logger.Error("panic recovered",
 					zap.Any("panic", rec),
 					zap.Stack("stack"),
+					zap.String("request_id", reqID),
 				)
 				writeJSON(w, http.StatusInternalServerError, APIError{
 					Code:    http.StatusInternalServerError,
@@ -91,7 +101,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // TODO: For production, restrict to specific origins instead of "*".
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", Cfg.Cors.Origin)
+		w.Header().Set("Access-Control-Allow-Origin", Cfg.Api.CorsOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -104,29 +114,65 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// TODO: requestIDMiddleware
-// Injects a unique correlation ID into every request so logs across services
-// can be tied together.
+// requestIDMiddleware injects a correlation ID into every request.
+// It reuses the X-Request-ID header sent by the client (e.g. from a load
+// balancer) if present; otherwise it generates a new UUID. The ID is stored
+// in context and echoed back so callers can trace a request end-to-end.
 //
-// Implementation:
-//  1. Read X-Request-ID header; generate a UUID if absent (crypto/rand or google/uuid)
-//  2. Store in context: ctx := context.WithValue(r.Context(), requestIDKey, id)
-//  3. Echo back: w.Header().Set("X-Request-ID", id)
-//  4. Call next.ServeHTTP(w, r.WithContext(ctx))
+// Must be the outermost middleware so the ID is available in every
+// downstream middleware (logging, recovery, rate limiting).
 func requestIDMiddleware(next http.Handler) http.Handler {
-	panic("not implemented yet")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = uuid.New().String()
+		}
+		ctx := context.WithValue(r.Context(), requestIDKey, id)
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
-// TODO: rateLimitMiddleware
-// Limits requests per remote IP using a Redis sliding window counter.
+// rateLimitMiddleware limits requests per remote IP using a fixed-window
+// counter backed by Redis.
 //
-// Implementation:
-//  1. Extract client IP from r.RemoteAddr (net.SplitHostPort)
-//  2. cache.Incr(ctx, "ratelimit:"+ip) — set TTL on first increment (e.g. 60s)
-//  3. If count > limit (e.g. 100 req/min): writeError(w, 429, "rate limit exceeded", nil)
-//  4. Otherwise call next.ServeHTTP(w, r)
+// On the first request within a window, Incr returns 1 and we set a TTL
+// (rateLimitTTL) so the counter resets automatically without a background job.
+// On subsequent requests within the same window, Incr returns 2, 3, … and we
+// compare against rateLimitValue.
+//
+// Fail-open strategy: if Redis is unavailable we let the request through
+// rather than blocking all traffic during a cache outage.
 func rateLimitMiddleware(next http.Handler) http.Handler {
-	panic("not implemented yet")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ctx := r.Context()
+
+		count, err := cache.Incr(ctx, rateLimitPrefix+host)
+		if err != nil {
+			// Fail open: Redis is down, let the request through.
+			logger.Warn("rate limit check failed, failing open",
+				zap.String("ip", host),
+				zap.Error(err),
+			)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Set the window TTL on the first increment so the counter expires
+		// automatically. Ignore the error — worst case the key has no TTL
+		// and resets on next restart.
+		if count == 1 {
+			_ = cache.Expire(ctx, rateLimitPrefix+host, rateLimitTTL)
+		}
+
+		if count > rateLimitValue {
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded", nil)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ============================================================================

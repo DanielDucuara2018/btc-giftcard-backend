@@ -18,9 +18,10 @@ import (
 type mockOnchainLNClient struct {
 	lnrpc.LightningClient // embed for interface compliance
 
-	sendCoinsFn     func(ctx context.Context, in *lnrpc.SendCoinsRequest, opts ...grpc.CallOption) (*lnrpc.SendCoinsResponse, error)
-	newAddressFn    func(ctx context.Context, in *lnrpc.NewAddressRequest, opts ...grpc.CallOption) (*lnrpc.NewAddressResponse, error)
-	walletBalanceFn func(ctx context.Context, in *lnrpc.WalletBalanceRequest, opts ...grpc.CallOption) (*lnrpc.WalletBalanceResponse, error)
+	sendCoinsFn       func(ctx context.Context, in *lnrpc.SendCoinsRequest, opts ...grpc.CallOption) (*lnrpc.SendCoinsResponse, error)
+	newAddressFn      func(ctx context.Context, in *lnrpc.NewAddressRequest, opts ...grpc.CallOption) (*lnrpc.NewAddressResponse, error)
+	walletBalanceFn   func(ctx context.Context, in *lnrpc.WalletBalanceRequest, opts ...grpc.CallOption) (*lnrpc.WalletBalanceResponse, error)
+	getTransactionsFn func(ctx context.Context, in *lnrpc.GetTransactionsRequest, opts ...grpc.CallOption) (*lnrpc.TransactionDetails, error)
 }
 
 func (m *mockOnchainLNClient) SendCoins(ctx context.Context, in *lnrpc.SendCoinsRequest, opts ...grpc.CallOption) (*lnrpc.SendCoinsResponse, error) {
@@ -33,6 +34,13 @@ func (m *mockOnchainLNClient) NewAddress(ctx context.Context, in *lnrpc.NewAddre
 
 func (m *mockOnchainLNClient) WalletBalance(ctx context.Context, in *lnrpc.WalletBalanceRequest, opts ...grpc.CallOption) (*lnrpc.WalletBalanceResponse, error) {
 	return m.walletBalanceFn(ctx, in, opts...)
+}
+
+func (m *mockOnchainLNClient) GetTransactions(ctx context.Context, in *lnrpc.GetTransactionsRequest, opts ...grpc.CallOption) (*lnrpc.TransactionDetails, error) {
+	if m.getTransactionsFn != nil {
+		return m.getTransactionsFn(ctx, in, opts...)
+	}
+	return &lnrpc.TransactionDetails{}, nil
 }
 
 func newOnchainTestClient(mock *mockOnchainLNClient) *Client {
@@ -252,4 +260,102 @@ func TestGetWalletBalance_LNDError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get wallet balance")
 	assert.Contains(t, err.Error(), "connection refused")
+}
+
+// ============================================================================
+// GetTransaction tests
+// ============================================================================
+
+func TestGetTransaction_Found(t *testing.T) {
+	txHash := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+
+	mock := &mockOnchainLNClient{
+		getTransactionsFn: func(_ context.Context, _ *lnrpc.GetTransactionsRequest, _ ...grpc.CallOption) (*lnrpc.TransactionDetails, error) {
+			return &lnrpc.TransactionDetails{
+				Transactions: []*lnrpc.Transaction{
+					{TxHash: "other_tx", NumConfirmations: 0},
+					{TxHash: txHash, NumConfirmations: 6, BlockHeight: 800001, BlockHash: "blockhash", Amount: 50000},
+				},
+			}, nil
+		},
+	}
+
+	client := newOnchainTestClient(mock)
+	status, err := client.GetTransaction(context.Background(), txHash)
+
+	require.NoError(t, err)
+	require.NotNil(t, status)
+	assert.True(t, status.Found)
+	assert.Equal(t, txHash, status.TxHash)
+	assert.Equal(t, int32(6), status.NumConfirmations)
+	assert.Equal(t, int32(800001), status.BlockHeight)
+	assert.Equal(t, "blockhash", status.BlockHash)
+	assert.Equal(t, int64(50000), status.Amount)
+}
+
+func TestGetTransaction_NotFound(t *testing.T) {
+	mock := &mockOnchainLNClient{
+		getTransactionsFn: func(_ context.Context, _ *lnrpc.GetTransactionsRequest, _ ...grpc.CallOption) (*lnrpc.TransactionDetails, error) {
+			return &lnrpc.TransactionDetails{
+				Transactions: []*lnrpc.Transaction{
+					{TxHash: "other_tx", NumConfirmations: 3},
+				},
+			}, nil
+		},
+	}
+
+	client := newOnchainTestClient(mock)
+	status, err := client.GetTransaction(context.Background(), "missing_hash")
+
+	require.NoError(t, err)
+	require.NotNil(t, status)
+	assert.False(t, status.Found)
+}
+
+func TestGetTransaction_EmptyWallet(t *testing.T) {
+	// LND returns no transactions at all (fresh node)
+	provided := &mockOnchainLNClient{} // getTransactionsFn nil → default empty list
+
+	client := newOnchainTestClient(provided)
+	status, err := client.GetTransaction(context.Background(), "any_hash")
+
+	require.NoError(t, err)
+	assert.False(t, status.Found)
+}
+
+func TestGetTransaction_LNDError(t *testing.T) {
+	mock := &mockOnchainLNClient{
+		getTransactionsFn: func(_ context.Context, _ *lnrpc.GetTransactionsRequest, _ ...grpc.CallOption) (*lnrpc.TransactionDetails, error) {
+			return nil, errors.New("connection refused")
+		},
+	}
+
+	client := newOnchainTestClient(mock)
+	status, err := client.GetTransaction(context.Background(), "any_hash")
+
+	assert.Nil(t, status)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get transactions from LND")
+	assert.Contains(t, err.Error(), "connection refused")
+}
+
+func TestGetTransaction_ZeroConfirmations(t *testing.T) {
+	txHash := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+
+	mock := &mockOnchainLNClient{
+		getTransactionsFn: func(_ context.Context, _ *lnrpc.GetTransactionsRequest, _ ...grpc.CallOption) (*lnrpc.TransactionDetails, error) {
+			return &lnrpc.TransactionDetails{
+				Transactions: []*lnrpc.Transaction{
+					{TxHash: txHash, NumConfirmations: 0, BlockHeight: 0},
+				},
+			}, nil
+		},
+	}
+
+	client := newOnchainTestClient(mock)
+	status, err := client.GetTransaction(context.Background(), txHash)
+
+	require.NoError(t, err)
+	assert.True(t, status.Found)
+	assert.Equal(t, int32(0), status.NumConfirmations, "unconfirmed tx should have 0 confirmations")
 }

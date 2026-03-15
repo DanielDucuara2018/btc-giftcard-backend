@@ -25,5 +25,5 @@ network = "testnet"
 payment_timeout_seconds = 30
 max_payment_fee_sats = 100
 
-[cors]
-origin = "*"
+[api]
+cors_origin = "*"

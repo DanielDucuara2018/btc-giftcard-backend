@@ -47,7 +47,7 @@ func setupTestService(t *testing.T) (*Service, *database.DB, *database.CardRepos
 	err := queue.DeclareStream(ctx, "fund_card", "test_workers")
 	require.NoError(t, err)
 
-	service := NewService(cardRepo, txRepo, "testnet", queue, nil)
+	service := NewService(db, cardRepo, txRepo, "testnet", queue, nil)
 
 	return service, db, cardRepo, redisClient
 }

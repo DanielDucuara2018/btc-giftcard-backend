@@ -1,25 +1,17 @@
 package main
 
 import (
-	"btc-giftcard/internal/card"
 	"net/http"
 )
 
 // handler holds dependencies for all HTTP endpoint handlers.
 type handler struct {
-	cardService *card.Service
+	cardService cardServicer
 }
 
-func newHandler(cardService *card.Service) *handler {
+func newHandler(cardService cardServicer) *handler {
 	return &handler{cardService: cardService}
 }
-
-// TODO Middleware to apply (in order):
-//   - Request logging (method, path, status, duration)
-//   - Panic recovery (catch panics, return 500)
-//   - CORS headers (configurable allowed origins)
-//   - Request ID injection (X-Request-ID header)
-//   - Rate limiting per IP (Redis-backed, configurable limits)
 
 // registerCardRoutes registers card CRUD and redemption endpoints.
 func (h *handler) registerCardRoutes(mux *http.ServeMux) {
@@ -39,11 +31,12 @@ func (h *handler) registerTreasuryRoutes(mux *http.ServeMux) {
 //
 // Middleware order (outermost → innermost):
 //
-//  1. loggingMiddleware  — logs after the request completes (captures real status + duration)
-//  2. recoveryMiddleware — catches panics, writes 500 before logging records it
-//  3. corsMiddleware     — sets CORS headers, short-circuits OPTIONS preflights
-//
-// Pending: requestIDMiddleware, rateLimitMiddleware (see middleware.go TODOs).
+//  1. requestIDMiddleware — injects/echoes X-Request-ID; must be outermost so all
+//     downstream middleware (logging, recovery) have the ID in context
+//  2. loggingMiddleware   — logs after the request completes (captures real status + duration + request ID)
+//  3. recoveryMiddleware  — catches panics, writes 500 before logging records it
+//  4. corsMiddleware      — sets CORS headers, short-circuits OPTIONS preflights
+//  5. rateLimitMiddleware — rejects IPs exceeding the per-window request limit
 func (h *handler) routes() http.Handler {
 	root := http.NewServeMux()
 
@@ -54,5 +47,5 @@ func (h *handler) routes() http.Handler {
 	root.Handle("/api/", http.StripPrefix("/api", apiV1))
 	root.HandleFunc("GET /health", h.healthCheck)
 
-	return loggingMiddleware(recoveryMiddleware(corsMiddleware(root)))
+	return requestIDMiddleware(loggingMiddleware(recoveryMiddleware(corsMiddleware(rateLimitMiddleware(root)))))
 }
