@@ -1,6 +1,6 @@
 module btc-giftcard
 
-go 1.24.11
+go 1.25.8
 
 require (
 	github.com/btcsuite/btcd v0.24.3-0.20250318170759-4f4ea81776d6

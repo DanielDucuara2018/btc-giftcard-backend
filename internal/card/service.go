@@ -127,20 +127,20 @@ func (c CreateCardFiatCurrency) IsValid() bool {
 // BTCAmountSats is NOT provided at creation — it will be calculated and set
 // by the fund_card worker based on the current BTC/fiat exchange rate.
 type CreateCardRequest struct {
-	FiatAmountCents    int64                  // Face value in cents ($100 = 10000)
-	FiatCurrency       CreateCardFiatCurrency // "USD", "EUR", etc.
-	PurchasePriceCents int64                  // Total charged including fees
-	UserID             *string
-	PurchaseEmail      string
+	FiatAmountCents    int64                  `json:"fiat_amount_cents"`
+	FiatCurrency       CreateCardFiatCurrency `json:"fiat_currency"`
+	PurchasePriceCents int64                  `json:"purchase_price_cents"`
+	UserID             *string                `json:"user_id,omitempty"`
+	PurchaseEmail      string                 `json:"purchase_email"`
 }
 
 // CreateCardResponse contains the created card details.
 type CreateCardResponse struct {
-	CardID        string
-	Code          string
-	BTCAmountSats int64
-	Status        database.CardStatus
-	CreatedAt     time.Time
+	CardID        string              `json:"card_id"`
+	Code          string              `json:"code"`
+	BTCAmountSats int64               `json:"btc_amount_sats"`
+	Status        database.CardStatus `json:"status"`
+	CreatedAt     time.Time           `json:"created_at"`
 }
 
 // validateCreateRequest validates the create card request fields.
@@ -250,22 +250,22 @@ const (
 
 // RedeemCardRequest contains the parameters for redeeming (spending) a card.
 type RedeemCardRequest struct {
-	Code               string           // Card redemption code
-	Method             RedeemCardMethod // "lightning" or "onchain"
-	AmountSats         int64            // Amount to spend (can be partial)
-	DestinationAddress string           // On-chain Bitcoin address (required if method=onchain)
-	LightningInvoice   string           // BOLT11 invoice (required if method=lightning)
+	Code               string           `json:"code"`
+	Method             RedeemCardMethod `json:"method"`
+	AmountSats         int64            `json:"amount_sats"`
+	DestinationAddress string           `json:"destination_address,omitempty"`
+	LightningInvoice   string           `json:"invoice,omitempty"`
 }
 
 // RedeemCardResponse contains the redemption transaction details.
 type RedeemCardResponse struct {
-	TransactionID    string
-	Method           string  // "lightning" or "onchain"
-	TxHash           *string // On-chain tx hash (nil for Lightning)
-	PaymentHash      *string // Lightning payment hash (nil for on-chain)
-	BTCAmountSats    int64
-	RemainingBalance int64 // Card's remaining balance after this spend
-	Status           database.TransactionStatus
+	TransactionID    string                     `json:"transaction_id"`
+	Method           string                     `json:"method"`
+	TxHash           *string                    `json:"tx_hash,omitempty"`
+	PaymentHash      *string                    `json:"payment_hash,omitempty"`
+	BTCAmountSats    int64                      `json:"btc_amount_sats"`
+	RemainingBalance int64                      `json:"remaining_balance_sats"`
+	Status           database.TransactionStatus `json:"status"`
 }
 
 // RedeemCard processes a card spend (full or partial) via Lightning or on-chain.

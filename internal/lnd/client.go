@@ -138,6 +138,28 @@ type LightningClient interface {
 	//   - Return Found=false when the tx is not in LND's wallet history
 	GetTransaction(ctx context.Context, txHash string) (*OnChainTxStatus, error)
 
+	// ---- Peer & channel management ----
+
+	// ConnectPeer establishes a P2P connection to another Lightning node.
+	// Must be called before OpenChannel if we are not already connected.
+	// pubKey is the remote node's compressed public key (hex, 66 chars).
+	// host is "ip:port" or "onion:port".
+	ConnectPeer(ctx context.Context, pubKey, host string) (*ConnectPeerResult, error)
+
+	// ListPeers returns all currently connected P2P peers.
+	ListPeers(ctx context.Context) ([]Peer, error)
+
+	// OpenChannel opens a new Lightning channel to a connected peer.
+	// localAmtSats is our initial channel balance (minimum ~20 000 sats for testnet).
+	// pushAmtSats is how many sats to push to the remote side immediately (usually 0).
+	// targetConf controls the on-chain fee speed for the funding tx.
+	// Returns the funding transaction details; the channel becomes usable after
+	// ~3 confirmations (testnet) or 3–6 (mainnet).
+	OpenChannel(ctx context.Context, peerPubKey string, localAmtSats, pushAmtSats int64, targetConf int32) (*OpenChannelResult, error)
+
+	// ListChannels returns all open (active + inactive) channels.
+	ListChannels(ctx context.Context) ([]Channel, error)
+
 	// Close closes the underlying gRPC connection.
 	Close() error
 }
@@ -171,27 +193,67 @@ type Invoice struct {
 }
 
 type OnChainResult struct {
-	TxHash string // Hex-encoded transaction hash (64 chars)
+	TxHash string `json:"tx_hash"` // Hex-encoded transaction hash (64 chars)
 }
 
 type WalletBalance struct {
-	ConfirmedSats   int64 // On-chain confirmed balance
-	UnconfirmedSats int64 // On-chain unconfirmed (pending) balance
-	TotalSats       int64 // Confirmed + Unconfirmed
+	ConfirmedSats   int64 `json:"confirmed_sats"`   // On-chain confirmed balance
+	UnconfirmedSats int64 `json:"unconfirmed_sats"` // On-chain unconfirmed (pending) balance
+	TotalSats       int64 `json:"total_sats"`       // Confirmed + Unconfirmed
 }
 
 type ChannelBalance struct {
-	LocalSats  int64 // Our side of channels (spendable via Lightning)
-	RemoteSats int64 // Remote side of channels (receivable capacity)
+	LocalSats  int64 `json:"local_sats"`  // Our side of channels (spendable via Lightning)
+	RemoteSats int64 `json:"remote_sats"` // Remote side of channels (receivable capacity)
 }
 
 type NodeInfo struct {
-	Alias         string
-	PubKey        string
-	SyncedToChain bool
-	SyncedToGraph bool
-	BlockHeight   uint32
-	NumChannels   uint32
+	Alias         string `json:"alias"`
+	PubKey        string `json:"pub_key"`
+	SyncedToChain bool   `json:"synced_to_chain"`
+	SyncedToGraph bool   `json:"synced_to_graph"`
+	BlockHeight   uint32 `json:"block_height"`
+	NumChannels   uint32 `json:"num_channels"`
+}
+
+// Peer represents a connected Lightning Network peer.
+type Peer struct {
+	PubKey    string `json:"pub_key"` // compressed public key (hex, 66 chars)
+	Address   string `json:"address"` // "ip:port"
+	BytesSent uint64 `json:"bytes_sent"`
+	BytesRecv uint64 `json:"bytes_recv"`
+	SatsSent  int64  `json:"sats_sent"`
+	SatsRecv  int64  `json:"sats_recv"`
+	Inbound   bool   `json:"inbound"`   // true if they initiated the connection
+	PingTime  int64  `json:"ping_time"` // round-trip time in microseconds
+}
+
+// Channel represents an open Lightning channel.
+type Channel struct {
+	Active            bool   `json:"active"`
+	RemotePubKey      string `json:"remote_pub_key"`
+	ChannelPoint      string `json:"channel_point"` // "funding_txid:output_index"
+	ChanID            uint64 `json:"chan_id"`
+	CapacitySats      int64  `json:"capacity_sats"`
+	LocalBalanceSats  int64  `json:"local_balance_sats"`
+	RemoteBalanceSats int64  `json:"remote_balance_sats"`
+	TotalSatsSent     int64  `json:"total_sats_sent"`
+	TotalSatsRecv     int64  `json:"total_sats_recv"`
+	NumUpdates        uint64 `json:"num_updates"`
+	Private           bool   `json:"private"`
+}
+
+// OpenChannelResult contains the funding transaction details for a new channel.
+type OpenChannelResult struct {
+	FundingTxID  string `json:"funding_txid"`  // hex-encoded funding transaction ID
+	OutputIndex  uint32 `json:"output_index"`  // output index within the funding tx
+	ChannelPoint string `json:"channel_point"` // "txid:index" — canonical channel identifier
+}
+
+// ConnectPeerResult is returned after successfully connecting to a peer.
+type ConnectPeerResult struct {
+	PubKey  string `json:"pub_key"`
+	Address string `json:"address"`
 }
 
 // OnChainTxStatus holds the confirmation status of an on-chain transaction.

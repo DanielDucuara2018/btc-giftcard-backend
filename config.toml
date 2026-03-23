@@ -18,7 +18,7 @@ db = 0
 
 [lnd]
 grpc_host = "localhost"
-port = "10009"
+grpc_port = "10009"
 tls_cert_path = ""
 macaroon_path = ""
 network = "testnet"
@@ -27,3 +27,21 @@ max_payment_fee_sats = 100
 
 [api]
 cors_origin = "*"
+
+[qonto]
+base_url = "https://thirdparty.qonto.com/v2"
+login = ""
+secret_key = ""
+iban = ""
+
+[cryptocom]
+base_url = "https://api.crypto.com/exchange/v1"
+api_key = ""
+secret_key = ""
+
+[treasury]
+lightning_ratio = 0.6
+cryptocom_iban = ""
+cryptocom_name = ""
+purchase_floor_cents = 1000000
+purchase_target_cents = 500000

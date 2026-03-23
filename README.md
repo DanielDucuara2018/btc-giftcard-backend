@@ -201,9 +201,12 @@ btc-giftcard/
 │   └── logger/                 # Zap structured logging
 ├── config/                     # Config structs + TOML loader
 ├── config.toml                 # App configuration
-├── docker-compose.yml          # PostgreSQL, Redis, LND containers
+├── docker-compose.yml          # Primary stack: Postgres, Redis, LND (testnet neutrino), lnd-creds-exporter
+├── docker-compose.regtest.yml  # Regtest override: bitcoind + lnd_customer, isolated volumes
+├── scripts/
+│   └── regtest-setup.sh        # One-command regtest bootstrap (mine blocks, open channel)
 ├── migrations/                 # SQL migration files
-└── lnd-creds/                  # TLS cert + macaroon (git-ignored)
+└── lnd-creds/                  # TLS cert + macaroon (git-ignored, populated by lnd-creds-exporter)
 ```
 
 ---
@@ -296,42 +299,31 @@ max_payment_fee_sats = 100
 ### Prerequisites
 
 - Go 1.24+
-- Docker & Docker Compose
-- LND credentials (TLS cert + macaroon)
+- Docker & Docker Compose v2
 
-### 1. Start Infrastructure
-
-```bash
-docker compose up -d   # PostgreSQL, Redis, LND
-```
-
-### 2. Copy LND Credentials (first time only)
+### 1. Start the full stack
 
 ```bash
-./scripts/copy-lnd-creds.sh
+docker compose up -d
 ```
 
-Then set `tls_cert_path` and `macaroon_path` in `config.toml`.
+This starts PostgreSQL, Redis, LND (testnet neutrino), and `lnd-creds-exporter`.
+`lnd-creds-exporter` is a one-shot container that waits for LND to become healthy,
+copies `tls.cert` and `admin.macaroon` from the LND volume to `./lnd-creds/`, then
+exits. The API server and workers wait for it to complete before starting — no manual
+credential copy is needed.
 
-### 3. Run the API Server
+LND takes 2–10 minutes to sync to testnet on first boot. Check progress:
 
 ```bash
-go run ./cmd/api
+curl http://localhost:3202/api/node/info | jq .synced_to_chain
 ```
 
-### 4. Run the Workers
-
-```bash
-# In separate terminals:
-go run ./cmd/worker/fund_card
-go run ./cmd/worker/monitor_tx
-```
-
-### 5. Run Tests
+### 2. Run Tests
 
 ```bash
 go test ./...                     # All tests
-go test ./internal/lnd/... -v     # LND tests (47 unit)
+go test ./internal/lnd/... -v     # LND unit tests
 go test ./internal/card/... -v    # Card service tests
 ```
 

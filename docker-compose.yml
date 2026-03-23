@@ -1,3 +1,33 @@
+# ==============================================================================
+# BTC Gift Card — Docker Compose  (local development only)
+#
+# All Go services run via `go run` against a bind-mounted source tree, giving
+# instant feedback without rebuilding images.  Production containers are built
+# separately with `docker build --target <stage> .` and deployed via Cloud Run
+# or GKE (see btc-giftcard-infra/).
+#
+# Service IP map (169.254.12.0/24):
+#   .2  app              (API server)
+#   .3  worker_fund_card
+#   .4  worker_monitor_tx
+#   .5  postgres
+#   .6  redis
+#   .7  lnd
+#   .8  lnd-creds-exporter  (one-shot, exits after copying credentials)
+#
+# Usage:
+#   docker compose up
+#
+# LND credentials are automatically copied to ./lnd-creds by the
+# lnd-creds-exporter service once LND is healthy. No manual steps needed.
+#
+# Production checklist:
+#   - Remove --noseedbackup from lnd command
+#   - Change --bitcoin.testnet to --bitcoin.mainnet
+#   - Update macaroon paths from testnet → mainnet
+#   - Use --wallet-unlock-password-file for automated restarts
+# ==============================================================================
+
 networks:
   gift_card_bridge:
     driver: bridge
@@ -5,63 +35,149 @@ networks:
       config:
         - subnet: 169.254.12.0/24
 
-services:
-  # app:
-  #   build:
-  #     context: ./
-  #     dockerfile: ./Dockerfile
-  #     target: dev
-  #   networks:
-  #     gift_card_bridge:
-  #       ipv4_address: 169.254.12.2
-  #       aliases:
-  #         - "gift-card-backend.app"
-  #   ports:
-  #     - 3203:3203
-  #   volumes:
-  #     # Only mount source code for development (not dependencies)
-  #     - ./gift_card_backend:/app/gift_card_backend
-  #     - ./alembic:/app/alembic
-  #     - ./config.ini:/app/config.ini
-  #     - /app/gift_card_backend.egg-info/
-  #   env_file:
-  #     - .env
-  #   environment:
-  #     # Prevent Python from writing .pyc files and buffer output
-  #     - PYTHONDONTWRITEBYTECODE=1
-  #     - PYTHONUNBUFFERED=1
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
+# Shared environment that points each service at the correct container hostnames
+# and LND credential paths. These override the localhost defaults in config.toml.
+x-app-env: &app-env
+  BTC_GIFTCARD_DB_HOST: gift-card-backend.db
+  BTC_GIFTCARD_DB_PORT: "5432"
+  BTC_GIFTCARD_REDIS_HOST: gift-card-backend.cache
+  BTC_GIFTCARD_REDIS_PORT: "6379"
+  BTC_GIFTCARD_LND_GRPC_HOST: gift-card-backend.lnd
+  BTC_GIFTCARD_LND_TLS_CERT_PATH: /app/lnd-creds/tls.cert
+  BTC_GIFTCARD_LND_MACAROON_PATH: /app/lnd-creds/admin.macaroon
+  CONFIG_FILE: /app/config.toml
 
-  postgres:
-    image: postgres:17.1-alpine
+services:
+  # ----------------------------------------------------------------------------
+  # API server
+  # ----------------------------------------------------------------------------
+  app:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+      target: builder          # Go toolchain + cached modules; source is bind-mounted below
+    command: go run ./cmd/api
+    networks:
+      gift_card_bridge:
+        ipv4_address: 169.254.12.2
+        aliases:
+          - "gift-card-backend.app"
+    ports:
+      - "3202:3202"
+    volumes:
+      - .:/app                              # live source bind-mount
+      - go_cache:/root/go/pkg/mod           # reuse downloaded modules across restarts
+      - ./lnd-creds:/app/lnd-creds:ro
+    env_file:
+      - .env
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      lnd:
+        condition: service_healthy                    # fix: was service_started
+      lnd-creds-exporter:
+        condition: service_completed_successfully     # fix: was missing
+
+  # ----------------------------------------------------------------------------
+  # fund_card worker
+  # ----------------------------------------------------------------------------
+  worker_fund_card:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+      target: builder
+    command: go run ./cmd/worker/fund_card
     networks:
       gift_card_bridge:
         ipv4_address: 169.254.12.3
         aliases:
+          - "gift-card-backend.worker.fund-card"
+    volumes:
+      - .:/app
+      - go_cache:/root/go/pkg/mod
+      - ./lnd-creds:/app/lnd-creds:ro
+    env_file:
+      - .env
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      lnd:
+        condition: service_healthy                    # fix: was service_started
+      lnd-creds-exporter:
+        condition: service_completed_successfully     # fix: was missing
+
+  # ----------------------------------------------------------------------------
+  # monitor_tx worker
+  # ----------------------------------------------------------------------------
+  worker_monitor_tx:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+      target: builder
+    command: go run ./cmd/worker/monitor_tx
+    networks:
+      gift_card_bridge:
+        ipv4_address: 169.254.12.4
+        aliases:
+          - "gift-card-backend.worker.monitor-tx"
+    volumes:
+      - .:/app
+      - go_cache:/root/go/pkg/mod
+      - ./lnd-creds:/app/lnd-creds:ro
+    env_file:
+      - .env
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      lnd:
+        condition: service_healthy
+      lnd-creds-exporter:
+        condition: service_completed_successfully
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:17.1-alpine
+    networks:
+      gift_card_bridge:
+        ipv4_address: 169.254.12.5
+        aliases:
           - "gift-card-backend.db"
     ports:
-      - 5432:5432
+      - "5432:5432"
     environment:
       POSTGRES_PASSWORD: postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./pgsql/init.d:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]  # fix: added -d flag
       interval: 5s
       timeout: 3s
       retries: 3
       start_period: 10s
 
+  # ----------------------------------------------------------------------------
+  # Redis
+  # ----------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     networks:
       gift_card_bridge:
-        ipv4_address: 169.254.12.4
+        ipv4_address: 169.254.12.6
         aliases:
           - "gift-card-backend.cache"
     ports:
@@ -76,43 +192,78 @@ services:
       retries: 3
       start_period: 5s
 
-  # =========================================================================
-  # FIRST-TIME SETUP:
-  # =========================================================================
-  #   1. Start LND: docker compose up -d lnd
-  #   2. Wait ~10s for LND to generate TLS cert + macaroons
-  #   3. Copy certs to host: ./scripts/copy-lnd-creds.sh
-  #   4. Set paths in config.toml [lnd] section:
-  #        tls_cert_path = "./lnd-creds/tls.cert"
-  #        macaroon_path = "./lnd-creds/admin.macaroon"
-  #   5. For production: remove --noseedbackup, use `lncli create` to set
-  #      a wallet password, and use `lncli unlock` on restarts (or use
-  #      --wallet-unlock-password-file for automation)
-  # =========================================================================
+  # ----------------------------------------------------------------------------
+  # LND (testnet, neutrino SPV)
+  #
+  # Credentials (tls.cert + admin.macaroon) are automatically exported to
+  # ./lnd-creds by the lnd-creds-exporter service once this is healthy.
+  #
+  # Production only:
+  #   - Remove --noseedbackup
+  #   - Run `lncli create` on first boot
+  #   - Use --wallet-unlock-password-file for automated restarts
+  # ----------------------------------------------------------------------------
   lnd:
     image: lightninglabs/lnd:v0.18.4-beta
     networks:
       gift_card_bridge:
-        ipv4_address: 169.254.12.5
+        ipv4_address: 169.254.12.7
         aliases:
           - "gift-card-backend.lnd"
     ports:
-      - "9735:9735"    # P2P Lightning port
-      - "10009:10009"  # gRPC API (used by our Go services)
-      - "8080:8080"    # REST API (optional, useful for debugging)
+      - "9735:9735"    # P2P Lightning (must be reachable externally to accept peer connections)
+      - "10009:10009"  # gRPC API — keep behind firewall, used only by Go services
+      - "8080:8080"    # REST API — optional, useful for debugging with lncli REST mode
     volumes:
       - lnd_data:/root/.lnd
     command:
-      - "--bitcoin.active"
-      - "--bitcoin.testnet"        # TODO: switch to --bitcoin.mainnet for production
-      - "--bitcoin.node=neutrino"  # lightweight SPV mode (no full bitcoind needed)
+      - "--bitcoin.testnet"         # Change to --bitcoin.mainnet for production
+      - "--bitcoin.node=neutrino"   # Lightweight SPV — no full bitcoind needed
       - "--rpclisten=0.0.0.0:10009"
       - "--restlisten=0.0.0.0:8080"
       - "--tlsextradomain=lnd"
-      - "--tlsextraip=169.254.12.5"
-      - "--noseedbackup"           # TODO: REMOVE in production — auto-creates wallet without seed backup
+      - "--tlsextradomain=gift-card-backend.lnd"
+      - "--tlsextraip=169.254.12.7" # LND's own IP so the TLS cert covers gRPC calls from other containers
+      - "--noseedbackup"            # REMOVE in production — auto-creates wallet without seed phrase
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          test -f /root/.lnd/tls.cert &&
+          test -f /root/.lnd/data/chain/bitcoin/testnet/admin.macaroon
+      interval: 5s
+      timeout: 60s
+      retries: 20
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # LND Creds Exporter — one-shot container that copies tls.cert + admin.macaroon
+  # from the lnd_data volume to the ./lnd-creds host bind-mount once LND is
+  # healthy, then exits. All three Go services depend on this completing
+  # successfully before they start.
+  # ----------------------------------------------------------------------------
+  lnd-creds-exporter:
+    image: lightninglabs/lnd:v0.18.4-beta
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        echo "Copying LND credentials..."
+        cp /root/.lnd/tls.cert /creds/tls.cert
+        cp /root/.lnd/data/chain/bitcoin/testnet/admin.macaroon /creds/admin.macaroon
+        chmod 644 /creds/tls.cert /creds/admin.macaroon
+        echo "Credentials exported successfully."
+    volumes:
+      - lnd_data:/root/.lnd:ro
+      - ./lnd-creds:/creds
+    depends_on:
+      lnd:
+        condition: service_healthy
+    restart: "no"
 
 volumes:
   postgres_data:
   redis_data:
   lnd_data:
+  go_cache:    # shared Go module cache — avoids re-downloading modules on every `docker compose up`

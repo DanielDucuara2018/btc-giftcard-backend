@@ -121,12 +121,19 @@ func initLogger() error {
 	return nil
 }
 
-// loadConfig reads config.toml relative to this source file.
+// loadConfig reads config.toml from the repo root.
+//
+// Resolution order:
+//  1. CONFIG_FILE env var — used by Docker containers (e.g. /app/config.toml)
+//  2. Path relative to this source file — used by `go run` in local development
 func loadConfig() error {
-	_, filename, _, _ := runtime.Caller(0)
-	root := filepath.Dir(filename)
-	configPath := config.Path(root).Join("config.toml", "..", "..", "..")
-	if err := config.Load(configPath, &Cfg); err != nil {
+	path := os.Getenv("CONFIG_FILE")
+	if path == "" {
+		_, filename, _, _ := runtime.Caller(0)
+		root := filepath.Dir(filename)
+		path = string(config.Path(root).Join("..", "..", "..", "config.toml"))
+	}
+	if err := config.Load(config.Path(path), &Cfg); err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	return nil
