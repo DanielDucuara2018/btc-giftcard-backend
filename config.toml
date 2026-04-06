@@ -29,18 +29,19 @@ max_payment_fee_sats = 100
 cors_origin = "*"
 
 [qonto]
-base_url = "https://thirdparty.qonto.com/v2"
+base_url = "https://thirdparty-sandbox.staging.qonto.co/v2"
 login = ""
 secret_key = ""
 iban = ""
 
 [cryptocom]
-base_url = "https://api.crypto.com/exchange/v1"
+base_url = "https://uat-api.3ona.co/exchange/v1/"
 api_key = ""
 secret_key = ""
+http_timeout = 15
 
 [treasury]
-lightning_ratio = 0.6
+lightning_ratio = 1
 cryptocom_iban = ""
 cryptocom_name = ""
 purchase_floor_cents = 1000000

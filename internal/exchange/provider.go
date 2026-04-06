@@ -32,10 +32,16 @@ type bitstamp struct {
 	baseURL    string
 }
 
+type cryptocom struct {
+	httpClient *http.Client
+	baseURL    string
+}
+
 const (
-	coinbaseBaseURL  = "https://api.coinbase.com"
-	coingeckoBaseURL = "https://api.coingecko.com"
-	bitstampBaseURL  = "https://www.bitstamp.net"
+	coinbaseBaseURL   = "https://api.coinbase.com"
+	coingeckoBaseURL  = "https://api.coingecko.com"
+	bitstampBaseURL   = "https://www.bitstamp.net"
+	cryptocompBaseURL = "https://api.crypto.com/exchange/v1"
 )
 
 type coinbasePriceResponse struct {
@@ -54,8 +60,16 @@ type bitstampPriceResponse struct {
 	Bid  string `json:"bid"`
 }
 
+type cryptocomPriceResponse struct {
+	Result struct {
+		Data []struct {
+			LastTradePrice string `json:"a"`
+		} `json:"data"`
+	} `json:"result"`
+}
+
 // NewProvider creates a new price provider instance by name.
-// Supported providers: "coinbase", "coingecko", "bitstamp"
+// Supported providers: "coinbase", "coingecko", "bitstamp", "cryptocom"
 //
 // Parameters:
 //   - providerName: Name of the provider (case-insensitive)
@@ -82,6 +96,8 @@ func NewProvider(providerName string, baseURL string, httpClient *http.Client) (
 			baseURL = coingeckoBaseURL
 		case "bitstamp":
 			baseURL = bitstampBaseURL
+		case "cryptocom":
+			baseURL = cryptocompBaseURL
 		default:
 			return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp)", providerName)
 		}
@@ -95,6 +111,8 @@ func NewProvider(providerName string, baseURL string, httpClient *http.Client) (
 		return &coingecko{httpClient: httpClient, baseURL: baseURL}, nil
 	case "bitstamp":
 		return &bitstamp{httpClient: httpClient, baseURL: baseURL}, nil
+	case "cryptocom":
+		return &cryptocom{httpClient: httpClient, baseURL: baseURL}, nil
 	default:
 		return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp)", providerName)
 	}
@@ -205,6 +223,34 @@ func (c *bitstamp) GetPrice(ctx context.Context, fiatCurrency string) (float64, 
 	}
 
 	logger.Info("Fetched BTC price from Bitstamp",
+		zap.String("currency", fiatCurrency),
+		zap.Float64("price", amount))
+
+	return amount, nil
+}
+
+func (c *cryptocom) GetPrice(ctx context.Context, fiatCurrency string) (float64, error) {
+	// TODO: GET /public/get-ticker?instrument_name=BTC_<FIATCURRENCY> (uppercase).
+	// Decode response into struct{ Result struct{ Data []struct{ A string `json:"a"` } `json:"data"` } `json:"result"` }.
+	// Parse Data[0].A (last trade price) with strconv.ParseFloat, validate > 0, return.
+	fiatCurrency = strings.ToUpper(fiatCurrency)
+	apiURL := fmt.Sprintf("%s/public/get-tickers?instrument_namd=BTC_%s", c.baseURL, fiatCurrency)
+
+	var response cryptocomPriceResponse
+	if err := fetchJSON(ctx, c.httpClient, apiURL, &response); err != nil {
+		return 0, fmt.Errorf("crypto.com: %w", err)
+	}
+
+	amount, err := strconv.ParseFloat(response.Result.Data[0].LastTradePrice, 64)
+	if err != nil {
+		return 0, fmt.Errorf("crypto.com: invalid price format: %w", err)
+	}
+
+	if amount <= 0 {
+		return 0, fmt.Errorf("crypto.com: invalid price value: %f", amount)
+	}
+
+	logger.Info("Fetched BTC price from Crypto.com",
 		zap.String("currency", fiatCurrency),
 		zap.Float64("price", amount))
 

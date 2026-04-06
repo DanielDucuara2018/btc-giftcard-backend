@@ -80,7 +80,7 @@ func run() error {
 	}
 	defer db.Close()
 
-	provider, err := initExchangeProvider("coinbase", "", nil)
+	provider, err := initExchangeProvider("cryptocom", "", nil)
 	if err != nil {
 		return err
 	}
