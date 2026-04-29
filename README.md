@@ -1,6 +1,6 @@
 # BTC Gift Card — Bitcoin Gift Card Platform
 
-A custodial Bitcoin gift card service built in Go. Users purchase gift cards with fiat, and the platform holds BTC in a shared treasury (LND Lightning node). Cards are balance claims — BTC only moves when a user redeems via Lightning Network (instant) or on-chain (standard).
+A custodial Bitcoin gift card service built in Go. Users purchase gift cards with fiat, and the platform holds BTC in a shared treasury (LND Lightning node). Cards are balance claims — BTC only moves when a user redeems via Lightning Network.
 
 ---
 
@@ -41,7 +41,7 @@ stateDiagram-v2
 
 The platform does **not** create a wallet per card. Instead:
 
-- All BTC is held in a single LND Lightning node (channels + on-chain hot wallet).
+- All BTC is held in a single LND Lightning node (channel balance + on-chain wallet used for treasury deposits only).
 - Cards are database entries with a `btc_amount_sats` field representing their balance claim on the treasury.
 - BTC only leaves the treasury when a user redeems a card.
 
@@ -55,17 +55,13 @@ Available Balance = Treasury Balance − SUM(unredeemed card balances)
 ```mermaid
 graph TD
     API["API Server - cmd/api/main.go"] -->|FundCardMessage| Q1["fund_card - Redis Stream"]
-    API -->|MonitorTxMessage| Q2["monitor_tx - Redis Stream"]
     API --> DB[("PostgreSQL - cards · transactions")]
-    API -->|"PayInvoice · SendOnChain"| LND["LND Lightning Node - gRPC :10009"]
+    API -->|"PayInvoice"| LND["LND Lightning Node - gRPC :10009"]
 
     Q1 --> W1["fund_card worker - Fetch BTC price · Activate card"]
-    Q2 --> W2["monitor_tx worker - Poll tx confirms · Update status"]
 
     W1 -->|"treasury check · card update"| DB
-    W2 -->|"update tx status"| DB
     W1 -->|"GetChannelBalance · GetWalletBalance"| LND
-    W2 -->|"query tx confirms"| LND
 ```
 
 **API Endpoints:**
@@ -73,13 +69,13 @@ graph TD
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/cards` | Create card |
-| `POST /api/cards/{code}/redeem` | Redeem card (Lightning/on-chain) |
+| `POST /api/cards/{code}/redeem` | Redeem card via Lightning Network |
 | `GET /api/cards/{code}` | Get card details |
 | `GET /api/cards/{code}/balance` | Get balance |
 | `GET /api/treasury/balance` | Available treasury sats |
 | `GET /health` | Health check |
 
-**LND Operations:** PayInvoice, SendOnChain, GetWalletBalance, GetChannelBalance, NewAddress, GetInfo
+**LND Operations:** PayInvoice, DecodeInvoice, GetWalletBalance, GetChannelBalance, NewAddress, GetInfo
 
 ### Purchase Flow
 
@@ -116,44 +112,19 @@ sequenceDiagram
     participant API
     participant DB as PostgreSQL
     participant LND
-    participant Queue as Redis Stream
-    participant Monitor as monitor_tx worker
 
     User->>API: POST /api/cards/{code}/redeem
     API->>DB: Lock card, verify balance
-
-    alt Lightning
-        API->>LND: PayInvoice(invoice)
-        LND-->>API: payment_preimage
-        API->>DB: Update card balance, insert tx (confirmed)
-        API-->>User: 200 {preimage, remaining_balance}
-    else On-chain
-        API->>LND: SendOnChain(address, sats)
-        LND-->>API: tx_hash
-        API->>DB: Update card balance, insert tx (pending)
-        API->>Queue: Publish MonitorTxMessage
-        API-->>User: 200 {tx_hash, remaining_balance}
-
-        loop Until 6 confirmations
-            Queue->>Monitor: Consume message
-            Monitor->>LND: Query tx status
-            alt Confirmed
-                Monitor->>DB: Update tx (status=confirmed)
-            else Pending
-                Monitor->>Queue: Re-publish for later check
-            end
-        end
-    end
+    API->>LND: DecodeInvoice(invoice)
+    API->>LND: PayInvoice(invoice, maxFeeSats)
+    LND-->>API: payment_preimage
+    API->>DB: Update card balance, insert tx (confirmed)
+    API-->>User: 200 {preimage, remaining_balance}
 ```
 
-### Redemption Paths
+### Redemption
 
-| Method    | Speed    | Cost        | How                                      |
-|-----------|----------|-------------|------------------------------------------|
-| Lightning | Instant  | ~1 sat fee  | User provides BOLT11 invoice → LND pays  |
-| On-chain  | ~1 hour  | ~500+ sats  | User provides BTC address → LND sends    |
-
-Lightning payments confirm immediately. On-chain payments are tracked by the `monitor_tx` worker until they reach 6 confirmations.
+All redemptions use the Lightning Network. The user provides a BOLT11 invoice and the platform pays it instantly via the LND node. Payments confirm in seconds with near-zero fees.
 
 ---
 
@@ -168,10 +139,8 @@ btc-giftcard/
 │   │   ├── handlers.go         #   HTTP handlers (card, treasury, health)
 │   │   └── middleware.go       #   Logging, recovery, CORS, error helpers
 │   ├── worker/
-│   │   ├── fund_card/          # Fund card worker
-│   │   │   └── main.go         #   Fetch price → calculate sats → delegate to Service.FundCard
-│   │   └── monitor_tx/         # Monitor transaction worker
-│   │       └── main.go         #   Poll on-chain tx confirmations → update status
+│   │   └── fund_card/          # Fund card worker
+│   │       └── main.go         #   Fetch price → calculate sats → delegate to Service.FundCard
 │   └── migrate/                # Database migration runner
 ├── internal/
 │   ├── card/                   # Core business logic
@@ -180,18 +149,17 @@ btc-giftcard/
 │   ├── lnd/                    # LND gRPC client wrapper
 │   │   ├── client.go           #   Connection, TLS, macaroon auth
 │   │   ├── lightning.go        #   PayInvoice, DecodeInvoice
-│   │   ├── onchain.go          #   SendOnChain, NewAddress, GetWalletBalance
+│   │   ├── onchain.go          #   NewAddress, GetWalletBalance
 │   │   ├── treasury.go         #   GetChannelBalance, GetInfo
-│   │   └── *_test.go           #   47 unit + 7 integration tests
+│   │   └── *_test.go           #   Unit + integration tests
 │   ├── database/               # PostgreSQL models + repositories
 │   │   ├── model.go            #   Card, Transaction, enums
 │   │   ├── card_repository.go  #   CRUD for cards
 │   │   └── transaction_repository.go # CRUD for transactions
 │   ├── queue/                  # Message definitions
-│   │   └── messages.go         #   FundCardMessage, MonitorTransactionMessage
+│   │   └── messages.go         #   FundCardMessage
 │   ├── exchange/               # BTC/fiat price providers
 │   │   └── provider.go         #   Coinbase, CoinGecko, Bitstamp
-│   ├── wallet/                 # Bitcoin address validation (btcutil)
 │   ├── crypto/                 # AES-256-GCM encryption utilities
 │   ├── payment/                # (placeholder) Bank transfer integration
 │   └── merchant/               # (placeholder) Merchant payment features
@@ -238,7 +206,7 @@ btc-giftcard/
 | id                 | UUID PK   | Transaction identifier                       |
 | card_id            | UUID FK   | Associated card                              |
 | type               | TEXT      | fund / redeem / payment                      |
-| redemption_method  | TEXT NULL | lightning / onchain                          |
+| redemption_method  | TEXT NULL | lightning                                     |
 | tx_hash            | TEXT NULL | On-chain transaction hash                    |
 | payment_hash       | TEXT NULL | Lightning payment hash                       |
 | payment_preimage   | TEXT NULL | Lightning proof of payment                   |
@@ -262,7 +230,6 @@ btc-giftcard/
 | `treasury:lock`          | Distributed lock for treasury writes | 5s   |
 | `card:lock:{code}`       | Per-card lock (concurrent redemption)| 10s  |
 | `fund_card` stream       | Queue for card funding messages      | —    |
-| `monitor_tx` stream      | Queue for tx monitoring messages     | —    |
 
 ---
 
@@ -343,5 +310,4 @@ go build ./...        # Build everything
 ```bash
 go build -o bin/api ./cmd/api
 go build -o bin/fund-worker ./cmd/worker/fund_card
-go build -o bin/monitor-worker ./cmd/worker/monitor_tx
 ```

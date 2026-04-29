@@ -19,7 +19,6 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/api               ./cmd/api && \
     CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/fund_card_worker   ./cmd/worker/fund_card && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/monitor_tx_worker  ./cmd/worker/monitor_tx
 
 # ============================================================================
 # api — production runtime image for the HTTP API server.
@@ -44,11 +43,3 @@ COPY --from=builder /bin/fund_card_worker /bin/fund_card_worker
 COPY config.toml /app/config.toml
 CMD ["/bin/fund_card_worker"]
 
-# ============================================================================
-# monitor_tx_worker — production runtime image for the monitor_tx worker.
-# ============================================================================
-FROM gcr.io/distroless/static:nonroot AS monitor_tx_worker
-WORKDIR /app
-COPY --from=builder /bin/monitor_tx_worker /bin/monitor_tx_worker
-COPY config.toml /app/config.toml
-CMD ["/bin/monitor_tx_worker"]

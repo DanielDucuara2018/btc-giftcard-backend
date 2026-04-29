@@ -329,7 +329,7 @@ func TestHandleError_KnownErrorMapsToStatus(t *testing.T) {
 		{card.ErrInvalidCurrency, http.StatusBadRequest},
 		{card.ErrInvalidFiatAmount, http.StatusBadRequest},
 		{card.ErrLightningInvoice, http.StatusBadRequest},
-		{card.ErrInvalidAddress, http.StatusBadRequest},
+
 		{card.ErrInvalidMethod, http.StatusBadRequest},
 	}
 

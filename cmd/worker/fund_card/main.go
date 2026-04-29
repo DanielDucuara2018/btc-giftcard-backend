@@ -16,7 +16,7 @@
 //  4. Card is now active and spendable by the user
 //
 // No on-chain tx, no wallet generation, no private keys.
-// BTC only moves when user redeems (Lightning or on-chain).
+// BTC only moves when user redeems via Lightning Network.
 package main
 
 import (

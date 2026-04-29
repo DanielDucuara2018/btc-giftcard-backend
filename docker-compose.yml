@@ -9,7 +9,6 @@
 # Service IP map (169.254.12.0/24):
 #   .2  app              (API server)
 #   .3  worker_fund_card
-#   .4  worker_monitor_tx
 #   .5  postgres
 #   .6  redis
 #   .7  lnd
@@ -114,37 +113,6 @@ services:
       lnd-creds-exporter:
         condition: service_completed_successfully     # fix: was missing
 
-  # ----------------------------------------------------------------------------
-  # monitor_tx worker
-  # ----------------------------------------------------------------------------
-  worker_monitor_tx:
-    build:
-      context: ./
-      dockerfile: ./Dockerfile
-      target: builder
-    command: go run ./cmd/worker/monitor_tx
-    networks:
-      gift_card_bridge:
-        ipv4_address: 169.254.12.4
-        aliases:
-          - "gift-card-backend.worker.monitor-tx"
-    volumes:
-      - .:/app
-      - go_cache:/root/go/pkg/mod
-      - ./lnd-creds:/app/lnd-creds:ro
-    env_file:
-      - .env
-    environment:
-      <<: *app-env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      lnd:
-        condition: service_healthy
-      lnd-creds-exporter:
-        condition: service_completed_successfully
 
   # ----------------------------------------------------------------------------
   # PostgreSQL
@@ -160,6 +128,7 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: btcgifter
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./pgsql/init.d:/docker-entrypoint-initdb.d

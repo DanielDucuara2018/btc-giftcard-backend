@@ -102,10 +102,6 @@ services:
     environment:
       BTC_GIFTCARD_LND_NETWORK: regtest
 
-  worker_monitor_tx:
-    environment:
-      BTC_GIFTCARD_LND_NETWORK: regtest
-
   # ----------------------------------------------------------------------------
   # lnd_customer — simulates a customer's Lightning wallet in regtest.
   #

@@ -4,7 +4,6 @@ import (
 	"btc-giftcard/internal/database"
 	"btc-giftcard/internal/lnd"
 	messages "btc-giftcard/internal/queue"
-	"btc-giftcard/internal/wallet"
 	"btc-giftcard/pkg/cache"
 	"btc-giftcard/pkg/logger"
 	streams "btc-giftcard/pkg/queue"
@@ -31,7 +30,6 @@ var (
 	ErrInsufficientBalance = errors.New("insufficient treasury balance")
 	ErrTreasuryLockBusy    = errors.New("treasury lock is held by another process")
 	ErrInvalidMethod       = errors.New("invalid redeem method")
-	ErrInvalidAddress      = errors.New("invalid bitcoin address")
 	ErrLightningInvoice    = errors.New("lightning invoice is required")
 	ErrInvalidCurrency     = errors.New("unsupported fiat currency")
 	ErrInvalidFiatAmount   = errors.New("fiat amount must be positive")
@@ -51,10 +49,6 @@ const (
 	// Treasury distributed lock (Redis SETNX)
 	treasuryLockKey = "treasury:lock"
 	treasuryLockTTL = 5 * time.Second
-
-	// On-chain redemption defaults
-	defaultTargetConf    int32 = 6     // ~1 hour confirmation target
-	minOnChainAmountSats int64 = 10000 // 10k sats minimum (dust protection)
 
 	// Per-card lock for concurrent redemption protection
 	cardLockPrefix = "card:lock:"
@@ -244,17 +238,15 @@ func (s *Service) CreateCard(ctx context.Context, req CreateCardRequest) (*Creat
 type RedeemCardMethod string
 
 const (
-	OnChain   RedeemCardMethod = "onchain"
 	Lightning RedeemCardMethod = "lightning"
 )
 
 // RedeemCardRequest contains the parameters for redeeming (spending) a card.
 type RedeemCardRequest struct {
-	Code               string           `json:"code"`
-	Method             RedeemCardMethod `json:"method"`
-	AmountSats         int64            `json:"amount_sats"`
-	DestinationAddress string           `json:"destination_address,omitempty"`
-	LightningInvoice   string           `json:"invoice,omitempty"`
+	Code             string           `json:"code"`
+	Method           RedeemCardMethod `json:"method"`
+	AmountSats       int64            `json:"amount_sats"`
+	LightningInvoice string           `json:"invoice,omitempty"`
 }
 
 // RedeemCardResponse contains the redemption transaction details.
@@ -268,11 +260,10 @@ type RedeemCardResponse struct {
 	Status           database.TransactionStatus `json:"status"`
 }
 
-// RedeemCard processes a card spend (full or partial) via Lightning or on-chain.
+// RedeemCard processes a card spend (full or partial) via Lightning Network.
 // Cards support partial spends — multiple transactions until balance reaches 0.
 //
 // Concurrency: a per-card Redis lock prevents double-spend from concurrent requests.
-// On-chain transactions publish a MonitorTransactionMessage for confirmation tracking.
 func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*RedeemCardResponse, error) {
 	// Step 1: Validate input
 	if err := s.validateRedeemRequest(req); err != nil {
@@ -342,11 +333,6 @@ func (s *Service) RedeemCard(ctx context.Context, req RedeemCardRequest) (*Redee
 
 	// Step 7: Invalidate treasury cache (balance changed)
 	s.InvalidateTreasuryCache(ctx)
-
-	// Step 8: Publish monitor message for on-chain transactions
-	if req.Method == OnChain && payResult.TxHash != nil {
-		s.publishMonitorTransaction(ctx, card.ID, redeemedTx.ID, *payResult.TxHash, req.AmountSats, req.DestinationAddress)
-	}
 
 	logger.Info("Card redeemed successfully",
 		zap.String("card_id", card.ID),
@@ -440,7 +426,7 @@ func (s *Service) GetTreasuryAvailableBalance(ctx context.Context) (int64, error
 }
 
 // ============================================================================
-// Worker methods — called by background workers (fund_card, monitor_tx)
+// Worker methods — called by background workers (fund_card)
 // ============================================================================
 
 // FundCard reserves treasury balance for a card, activating it.
@@ -635,10 +621,6 @@ func (s *Service) validateRedeemRequest(req RedeemCardRequest) error {
 		if req.LightningInvoice == "" {
 			return ErrLightningInvoice
 		}
-	case OnChain:
-		if req.DestinationAddress == "" {
-			return ErrInvalidAddress
-		}
 	default:
 		return ErrInvalidMethod
 	}
@@ -679,13 +661,11 @@ type paymentOutput struct {
 	ConfirmedAt     *time.Time
 }
 
-// executePayment dispatches to the correct payment path (Lightning or on-chain).
+// executePayment dispatches to the correct payment path.
 func (s *Service) executePayment(ctx context.Context, req RedeemCardRequest) (*paymentOutput, error) {
 	switch req.Method {
 	case Lightning:
 		return s.executeLightningPayment(ctx, req.LightningInvoice, req.AmountSats)
-	case OnChain:
-		return s.executeOnChainPayment(ctx, req.DestinationAddress, req.AmountSats)
 	default:
 		return nil, ErrInvalidMethod
 	}
@@ -734,41 +714,6 @@ func (s *Service) executeLightningPayment(ctx context.Context, invoice string, a
 		Invoice:         &invoice,
 		Status:          database.Confirmed, // Lightning settles instantly
 		ConfirmedAt:     &now,
-	}, nil
-}
-
-// executeOnChainPayment validates the address and sends an on-chain transaction.
-func (s *Service) executeOnChainPayment(ctx context.Context, address string, amountSats int64) (*paymentOutput, error) {
-	// Validate destination address
-	isValid, err := wallet.ValidateAddress(address, s.network)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate address: %w", err)
-	}
-	if !isValid {
-		return nil, ErrInvalidAddress
-	}
-
-	// Enforce minimum on-chain amount (mining fees make tiny sends uneconomical)
-	if amountSats < minOnChainAmountSats {
-		return nil, fmt.Errorf("on-chain minimum is %d sats", minOnChainAmountSats)
-	}
-
-	// Send on-chain
-	logger.Info("Sending on-chain transaction",
-		zap.Int64("amount_sats", amountSats),
-		zap.String("destination", address),
-		zap.Int32("target_conf", defaultTargetConf),
-	)
-
-	result, err := s.lndClient.SendOnChain(ctx, address, amountSats, defaultTargetConf)
-	if err != nil {
-		return nil, fmt.Errorf("on-chain send failed: %w", err)
-	}
-
-	return &paymentOutput{
-		TxHash:    &result.TxHash,
-		ToAddress: &address,
-		Status:    database.Pending, // Confirmed later by monitor worker
 	}, nil
 }
 
@@ -849,40 +794,6 @@ func retryWithBackoff(ctx context.Context, maxAttempts int, initialDelay time.Du
 		}
 	}
 	return lastErr
-}
-
-// publishMonitorTransaction publishes a MonitorTransactionMessage so a worker
-// can track on-chain confirmations and update the transaction status.
-func (s *Service) publishMonitorTransaction(ctx context.Context, cardID, txID, txHash string, amountSats int64, destAddr string) {
-	msg := messages.MonitorTransactionMessage{
-		CardID:             cardID,
-		TxHash:             txHash,
-		ExpectedAmountSats: amountSats,
-		DestinationAddr:    destAddr,
-	}
-
-	msgJSON, err := msg.ToJSON()
-	if err != nil {
-		logger.Error("Failed to serialize MonitorTransactionMessage",
-			zap.String("card_id", cardID),
-			zap.String("tx_id", txID),
-			zap.Error(err),
-		)
-		return
-	}
-
-	if _, err := s.queue.Publish(ctx, "monitor_tx", msgJSON); err != nil {
-		logger.Error("Failed to publish MonitorTransactionMessage",
-			zap.String("card_id", cardID),
-			zap.String("tx_hash", txHash),
-			zap.Error(err),
-		)
-	} else {
-		logger.Info("Published MonitorTransactionMessage",
-			zap.String("card_id", cardID),
-			zap.String("tx_hash", txHash),
-		)
-	}
 }
 
 // ============================================================================

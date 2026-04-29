@@ -61,18 +61,16 @@ func (m *mockCryptoCom) GetWithdrawal(ctx context.Context, withdrawalID string) 
 
 // mockLND implements lnd.LightningClient.
 type mockLND struct {
-	payInvoice     func(ctx context.Context, bolt11 string, maxFeeSats int64) (*lnd.PaymentResult, error)
-	decodeInvoice  func(ctx context.Context, bolt11 string) (*lnd.Invoice, error)
-	sendOnChain    func(ctx context.Context, address string, amountSats int64, targetConf int32) (*lnd.OnChainResult, error)
-	newAddress     func(ctx context.Context) (string, error)
-	getWalletBal   func(ctx context.Context) (*lnd.WalletBalance, error)
-	getChannelBal  func(ctx context.Context) (*lnd.ChannelBalance, error)
-	getInfo        func(ctx context.Context) (*lnd.NodeInfo, error)
-	getTransaction func(ctx context.Context, txHash string) (*lnd.OnChainTxStatus, error)
-	connectPeer    func(ctx context.Context, pubKey, host string) (*lnd.ConnectPeerResult, error)
-	listPeers      func(ctx context.Context) ([]lnd.Peer, error)
-	listChannels   func(ctx context.Context) ([]lnd.Channel, error)
-	openChannel    func(ctx context.Context, peerPubKey string, localAmtSats, pushAmtSats int64, targetConf int32) (*lnd.OpenChannelResult, error)
+	payInvoice    func(ctx context.Context, bolt11 string, maxFeeSats int64) (*lnd.PaymentResult, error)
+	decodeInvoice func(ctx context.Context, bolt11 string) (*lnd.Invoice, error)
+	newAddress    func(ctx context.Context) (string, error)
+	getWalletBal  func(ctx context.Context) (*lnd.WalletBalance, error)
+	getChannelBal func(ctx context.Context) (*lnd.ChannelBalance, error)
+	getInfo       func(ctx context.Context) (*lnd.NodeInfo, error)
+	connectPeer   func(ctx context.Context, pubKey, host string) (*lnd.ConnectPeerResult, error)
+	listPeers     func(ctx context.Context) ([]lnd.Peer, error)
+	listChannels  func(ctx context.Context) ([]lnd.Channel, error)
+	openChannel   func(ctx context.Context, peerPubKey string, localAmtSats, pushAmtSats int64, targetConf int32) (*lnd.OpenChannelResult, error)
 }
 
 func (m *mockLND) Close() error { return nil }
@@ -83,9 +81,7 @@ func (m *mockLND) PayInvoice(ctx context.Context, bolt11 string, maxFeeSats int6
 func (m *mockLND) DecodeInvoice(ctx context.Context, bolt11 string) (*lnd.Invoice, error) {
 	return m.decodeInvoice(ctx, bolt11)
 }
-func (m *mockLND) SendOnChain(ctx context.Context, address string, amountSats int64, targetConf int32) (*lnd.OnChainResult, error) {
-	return m.sendOnChain(ctx, address, amountSats, targetConf)
-}
+
 func (m *mockLND) NewAddress(ctx context.Context) (string, error) { return m.newAddress(ctx) }
 func (m *mockLND) GetWalletBalance(ctx context.Context) (*lnd.WalletBalance, error) {
 	return m.getWalletBal(ctx)
@@ -94,9 +90,7 @@ func (m *mockLND) GetChannelBalance(ctx context.Context) (*lnd.ChannelBalance, e
 	return m.getChannelBal(ctx)
 }
 func (m *mockLND) GetInfo(ctx context.Context) (*lnd.NodeInfo, error) { return m.getInfo(ctx) }
-func (m *mockLND) GetTransaction(ctx context.Context, txHash string) (*lnd.OnChainTxStatus, error) {
-	return m.getTransaction(ctx, txHash)
-}
+
 func (m *mockLND) ConnectPeer(ctx context.Context, pubKey, host string) (*lnd.ConnectPeerResult, error) {
 	return m.connectPeer(ctx, pubKey, host)
 }

@@ -68,7 +68,7 @@ type Transaction struct {
 	ID               string            `json:"id" db:"id"`
 	CardID           string            `json:"card_id" db:"card_id"`
 	Type             TransactionType   `json:"type" db:"type"`
-	RedemptionMethod *string           `json:"redemption_method,omitempty" db:"redemption_method"` // 'lightning' or 'onchain'
+	RedemptionMethod *string           `json:"redemption_method,omitempty" db:"redemption_method"` // 'lightning'
 	TxHash           *string           `json:"tx_hash,omitempty" db:"tx_hash"`                     // On-chain tx hash (NULL for Lightning)
 	PaymentHash      *string           `json:"payment_hash,omitempty" db:"payment_hash"`           // Lightning payment hash (NULL for on-chain)
 	PaymentPreimage  *string           `json:"payment_preimage,omitempty" db:"payment_preimage"`   // Lightning proof of payment (set on success)

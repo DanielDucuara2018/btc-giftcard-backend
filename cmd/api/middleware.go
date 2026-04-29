@@ -198,9 +198,8 @@ var errorStatusMap = map[error]int{
 	card.ErrCardNotActive:     http.StatusConflict,
 	card.ErrCardAlreadyUsed:   http.StatusConflict,
 	card.ErrInsufficientFunds: http.StatusUnprocessableEntity,
-	card.ErrInvalidMethod:     http.StatusBadRequest,
-	card.ErrInvalidAddress:    http.StatusBadRequest,
 	card.ErrLightningInvoice:  http.StatusBadRequest,
+	card.ErrInvalidMethod:     http.StatusBadRequest,
 }
 
 // writeJSON writes data as a JSON response with the given HTTP status code.

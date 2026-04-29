@@ -184,7 +184,6 @@ curl http://localhost:3202/health | jq .
 
 ```bash
 go run ./cmd/worker/fund_card
-go run ./cmd/worker/monitor_tx
 ```
 
 ---
@@ -341,9 +340,6 @@ INVOICE=$(docker compose -f docker-compose.yml -f docker-compose.regtest.yml \
 curl -X POST http://localhost:3202/api/cards/$CODE/redeem \
   -H "Content-Type: application/json" \
   -d "{\"method\":\"lightning\",\"invoice\":\"$INVOICE\", \"amount_sats\": $SATS}" | jq .
-
-# For on-chain redemption — mine blocks after sending to get confirmations
-# docker compose ... exec bitcoind bitcoin-cli ... generatetoaddress 6 "$ADDR"
 
 # Customer channel final balance
 CH_CUSTOMER_SATS=$(docker compose -f docker-compose.yml -f docker-compose.regtest.yml \
@@ -516,20 +512,6 @@ curl -X POST http://localhost:3202/api/cards/GIFT-XXXX-YYYY-ZZZZ/redeem \
   "status":               "confirmed"
 }
 ```
-
-### D. Redeem via on-chain (alternative)
-
-```bash
-curl -X POST http://localhost:3202/api/cards/GIFT-XXXX-YYYY-ZZZZ/redeem \
-  -H "Content-Type: application/json" \
-  -d '{
-    "method":  "onchain",
-    "address": "tb1q..."
-  }' | jq .
-```
-
-The `monitor_tx` worker tracks the transaction until 6 confirmations, updating
-the status from `pending` to `confirmed`.
 
 ### E. Treasury check
 
@@ -706,10 +688,10 @@ resource "google_compute_firewall" "api" {
 
 | Step | Task | Status |
 |------|------|--------|
-| 0.1  | LND gRPC client (pay, onchain, balances) | ✅ Done |
+| 0.1  | LND gRPC client (pay, balances) | ✅ Done |
 | 0.2  | Node management API (`/api/node/*`) | ✅ Done |
 | 0.3  | Card lifecycle (create, fund, redeem) | ✅ Done |
-| 0.4  | fund_card + monitor_tx workers | ✅ Done |
+| 0.4  | fund_card worker | ✅ Done |
 | 0.5  | Docker Compose stack (Postgres, Redis, LND) | ✅ Done |
 | 0.6  | LND testnet sync + wallet funding | 🔄 Manual step |
 | 0.7  | Connect peer + open channel via API | 🔄 Manual step |
@@ -794,7 +776,7 @@ All endpoints are prefixed with `/api`.
 | GET    | `/cards/{code}`             | Get card details             |
 | GET    | `/cards/{code}/balance`     | Get remaining balance        |
 | GET    | `/cards/{code}/validate`    | Validate card code           |
-| POST   | `/cards/{code}/redeem`      | Redeem (Lightning / on-chain)|
+| POST   | `/cards/{code}/redeem`      | Redeem via Lightning Network |
 
 ### Treasury
 

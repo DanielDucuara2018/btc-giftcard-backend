@@ -202,14 +202,6 @@ func TestNodeInfo_Fields(t *testing.T) {
 	assert.Equal(t, uint32(5), info.NumChannels)
 }
 
-func TestOnChainResult_Fields(t *testing.T) {
-	result := OnChainResult{
-		TxHash: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-	}
-
-	assert.Len(t, result.TxHash, 64, "tx hash should be 64 hex characters")
-}
-
 // --- Client.Close test ---
 
 func TestNewClient_ConnectsToLND_HasRouterClient(t *testing.T) {

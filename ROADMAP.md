@@ -1,7 +1,7 @@
 # BTC Gift Card Service - Implementation Roadmap
 
 **Last Updated:** July 2025  
-**Status:** Phase 1 partially complete, Phase 3-4 core done — HTTP API + monitor_tx worker next
+**Status:** Phase 1 partially complete, Phase 3-4 core done — HTTP API complete, Lightning-only redemption
 
 ---
 
@@ -39,20 +39,19 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 ### LND Package (47 unit + 7 integration tests)
 - ✅ gRPC client with TLS + macaroon auth — `internal/lnd/client.go`
 - ✅ Lightning payments (SendPaymentV2 streaming) — `internal/lnd/lightning.go`
-- ✅ On-chain transactions (SendCoins, NewAddress, WalletBalance) — `internal/lnd/onchain.go`
+- ✅ On-chain wallet queries (NewAddress, WalletBalance) — `internal/lnd/onchain.go`
 - ✅ Treasury queries (ChannelBalance, GetInfo) — `internal/lnd/treasury.go`
 - ✅ LND v0.20.1-beta module, Docker container on testnet (neutrino SPV)
 
 ### Card Service — Business Logic (`internal/card/service.go`)
 - ✅ **CreateCard** with `validateCreateRequest` — currency, amount, email validation
 - ✅ **FundCard** — treasury lock + balance check + card activation + revert-on-failure
-- ✅ **RedeemCard** — 8-step orchestrator with Lightning + on-chain dual path
+- ✅ **RedeemCard** — Lightning-only orchestrator (invoice decode → pay → record)
 - ✅ **GetCardByCode, GetCardBalance, ValidateCardCode** — read-only API methods
 - ✅ **GetTreasuryAvailableBalance** — Redis-cached (10s TTL) for API endpoints
 - ✅ Treasury distributed locking (Redis SETNX 5s TTL) + per-card locks (10s TTL)
 - ✅ `computeTreasuryBalance` — uncached authoritative balance for write paths
 - ✅ 14 sentinel errors, string-based enums, `CreateCardFiatCurrency` (USD/EUR)
-- ✅ `MonitorTransactionMessage` publishing for on-chain redemptions
 
 ### Workers
 - ✅ **fund_card worker** — thin adapter delegating to `card.Service.FundCard()`
@@ -393,7 +392,7 @@ Three layers of defence are implemented or planned:
 - [x] **Replace btcsuite with LND client** ✅ Done
   - Created `internal/lnd/client.go` (gRPC + TLS + macaroon, `LightningClient` interface)
   - `internal/lnd/lightning.go`: `PayInvoice` (SendPaymentV2 streaming), `DecodeInvoice`
-  - `internal/lnd/onchain.go`: `SendOnChain`, `NewAddress`, `GetWalletBalance`
+  - `internal/lnd/onchain.go`: `NewAddress`, `GetWalletBalance`
   - `internal/lnd/treasury.go`: `GetChannelBalance`, `GetInfo`
   - 47 unit tests + 7 integration tests passing
   - `PaymentResultStatus` enum: Succeeded/Failed/InFlight
@@ -523,11 +522,11 @@ Three layers of defence are implemented or planned:
 - [x] **Move redemption fields to transactions table** ✅ Done
   ```sql
   -- Transactions table now tracks per-spend details:
-  -- redemption_method TEXT NULL     — 'lightning' or 'onchain' (per transaction)
+  -- redemption_method TEXT NULL     — 'lightning' (per transaction)
   -- payment_hash VARCHAR(64) NULL   — Lightning payment identifier
   -- payment_preimage VARCHAR(64) NULL — Lightning proof of payment
   -- lightning_invoice TEXT NULL      — BOLT11 invoice string
-  -- tx_hash VARCHAR(64) NULL        — On-chain tx hash (existing)
+  -- tx_hash VARCHAR(64) NULL        — reserved for future use
   ```
   - Each spend creates a new transaction with its own method
   - Cards support partial spends (multiple redeems until balance = 0)
@@ -535,23 +534,18 @@ Three layers of defence are implemented or planned:
 
 ### 4.2 Redemption API Updates
 
-- [x] **Update `POST /api/cards/{id}/redeem` endpoint** ✅ Done (business logic)
-  - `RedeemCard(ctx, req)` accepts method (`lightning`/`onchain`), invoice/address, amount_sats
+- [x] **Update `POST /api/cards/{id}/redeem` endpoint** ✅ Done
+  - `RedeemCard(ctx, req)` accepts Lightning invoice + amount_sats
   - Partial spend support: amount_sats can be less than card balance
-  - Creates Transaction record with redemption_method + Lightning or on-chain fields
+  - Creates Transaction record with redemption_method=lightning
   - Deducts amount_sats from card's btc_amount_sats
   - Card stays `Active` until balance = 0, then becomes `Redeemed`
-  - Validates Lightning invoice amount and on-chain address (wallet.ValidateAddress)
-  - 8-step orchestrator: validate → lock → check card → pay → record tx → update balance → publish monitor
-  - ⚠️ **HTTP handler not yet wired** — business logic exists but no route serves it
+  - Validates Lightning invoice amount
+  - Orchestrator: validate → lock → check card → decode invoice → pay → record tx → update balance
 
-- [x] **Implement dual redemption worker** ✅ Done (in Service, not separate worker)
-  - `executePayment()` dispatches to `executeLightningPayment()` or `executeOnChainPayment()`
+- [x] **Lightning redemption** ✅ Done
   - **Lightning path:** `lndClient.PayInvoice()` (SendPaymentV2 streaming, maxFeeSats from config)
-  - **On-chain path:** `lndClient.SendOnChain()` (targetConf from config, minOnChainAmountSats=10000)
-  - `publishMonitorTransaction()` sends `MonitorTransactionMessage` to `"monitor_tx"` stream
   - PaymentResult.Status checked for Succeeded/Failed/InFlight
-  - ⚠️ **monitor_tx consumer worker not yet created**
 
 ### 4.3 User Experience - Lightning First
 

@@ -48,28 +48,6 @@ data, _ := msg.ToJSON()
 
 ---
 
-### MonitorTransactionMessage
-
-Represents a request to monitor a BTC transaction for confirmations.
-
-```go
-type MonitorTransactionMessage struct {
-    CardID             string `json:"card_id"`
-    TxHash             string `json:"tx_hash"`
-    ExpectedAmountSats int64  `json:"expected_amount_sats"`
-    DestinationAddr    string `json:"destination_addr"`
-}
-```
-
-**Methods:**
-- `ToJSON() ([]byte, error)` - Serializes the message to JSON bytes
-- `Validate() error` - Validates all required fields (including hex format for tx_hash)
-
-**Functions:**
-- `FromJSONMonitorTx(data []byte) (*MonitorTransactionMessage, error)` - Deserializes and validates JSON
-
----
-
 ## Exchange Providers (internal/exchange)
 
 ### PriceProvider Interface

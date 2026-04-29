@@ -39,7 +39,7 @@
 //	internal/lnd/
 //	├── client.go         ← THIS FILE: interface + Config + constructor
 //	├── lightning.go       ← Lightning payment methods (SendPayment, DecodeInvoice)
-//	├── onchain.go         ← On-chain methods (SendCoins, NewAddress, WalletBalance)
+//  ├── onchain.go         ← On-chain wallet queries (NewAddress, WalletBalance)
 //	└── treasury.go        ← Treasury balance aggregation (channel + on-chain)
 package lnd
 
@@ -96,15 +96,7 @@ type LightningClient interface {
 	//   - Validate: invoice not expired, amount > 0, correct network
 	DecodeInvoice(ctx context.Context, bolt11 string) (*Invoice, error)
 
-	// ---- On-chain transactions ----
-
-	// SendOnChain sends BTC from the LND wallet to a destination address.
-	// Used by card.Service.RedeemCard() when method == "onchain".
-	//   - Call lnrpc.Lightning.SendCoins() with target address and amount
-	//   - targetConf controls fee rate: 2=next block, 6=~1h, 144=~1day
-	//   - Return the tx_hash from the response
-	//   - Handle errors: INSUFFICIENT_FUNDS, INVALID_ADDRESS
-	SendOnChain(ctx context.Context, address string, amountSats int64, targetConf int32) (*OnChainResult, error)
+	// ---- On-chain ----
 
 	// NewAddress generates a new on-chain Bitcoin address from LND's wallet.
 	// Used for treasury deposit operations (receiving OTC-purchased BTC).
@@ -131,12 +123,6 @@ type LightningClient interface {
 	//   - Call lnrpc.Lightning.GetInfo()
 	//   - Return NodeInfo with synced_to_chain, synced_to_graph, block_height
 	GetInfo(ctx context.Context) (*NodeInfo, error)
-
-	// GetTransaction queries LND for the confirmation status of an on-chain
-	// transaction. Used by the monitor_tx worker to track confirmation progress.
-	//   - Call lnrpc.Lightning.GetTransactions() and search for txHash in results
-	//   - Return Found=false when the tx is not in LND's wallet history
-	GetTransaction(ctx context.Context, txHash string) (*OnChainTxStatus, error)
 
 	// ---- Peer & channel management ----
 
@@ -190,10 +176,6 @@ type Invoice struct {
 	Expiry      int64  // Seconds until invoice expires
 	Description string // Invoice description/memo
 	IsExpired   bool   // true if invoice has expired
-}
-
-type OnChainResult struct {
-	TxHash string `json:"tx_hash"` // Hex-encoded transaction hash (64 chars)
 }
 
 type WalletBalance struct {
@@ -254,16 +236,6 @@ type OpenChannelResult struct {
 type ConnectPeerResult struct {
 	PubKey  string `json:"pub_key"`
 	Address string `json:"address"`
-}
-
-// OnChainTxStatus holds the confirmation status of an on-chain transaction.
-type OnChainTxStatus struct {
-	TxHash           string
-	NumConfirmations int32
-	BlockHeight      int32
-	BlockHash        string
-	Amount           int64
-	Found            bool // false when LND has no record of this tx in its wallet
 }
 
 // ============================================================================

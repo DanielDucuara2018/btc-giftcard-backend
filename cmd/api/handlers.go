@@ -73,14 +73,6 @@ func (h *handler) createCard(w http.ResponseWriter, r *http.Request) {
 //	  "invoice": "lnbc500u1p..."
 //	}
 //
-// Request body (On-chain):
-//
-//	{
-//	  "method": "onchain",
-//	  "amount_sats": 100000,
-//	  "destination_address": "bc1q..."
-//	}
-//
 // Response 200:
 //
 //	{
