@@ -74,15 +74,15 @@ type ApiConfig struct {
 
 	// Treasury controls the automated fiat → BTC → LND pipeline
 	Treasury struct {
-		// LightningRatio is the fraction of new BTC routed to Lightning channels.
-		// The remainder stays in the LND on-chain wallet. Range: [0.0, 1.0].
-		LightningRatio float64 `toml:"lightning_ratio" env:"GIFTER_TREASURY_LIGHTNING_RATIO" env-default:"1"`
-
 		// CryptoComIBAN is the Crypto.com OTC SEPA IBAN (destination of fiat transfers).
 		CryptoComIBAN string `toml:"cryptocom_iban" env:"GIFTER_TREASURY_CRYPTOCOM_IBAN"`
 
 		// CryptoComBeneficiaryName is the legal beneficiary name for SEPA transfers.
 		CryptoComBeneficiaryName string `toml:"cryptocom_name" env:"GIFTER_TREASURY_CRYPTOCOM_NAME"`
+
+		// CryptoComBeneficiaryID is the pre-registered Qonto beneficiary UUID for the
+		// Crypto.com OTC account. Required for SendTransfer (Qonto v2 API).
+		CryptoComBeneficiaryID string `toml:"cryptocom_beneficiary_id" env:"GIFTER_TREASURY_CRYPTOCOM_BENEFICIARY_ID"`
 
 		// PurchaseFloorCents — automatic trigger fires when Qonto balance exceeds this (cents).
 		// Example: 1_000_000 = 10 000.00 EUR
@@ -91,5 +91,29 @@ type ApiConfig struct {
 		// PurchaseTargetCents — amount to leave in Qonto after an automatic purchase (cents).
 		// Example: 500_000 = 5 000.00 EUR
 		PurchaseTargetCents int64 `toml:"purchase_target_cents" env:"GIFTER_TREASURY_PURCHASE_TARGET" env-default:"500000"`
+
+		// LNDChannelPeerPubKey and LNDChannelPeerHost identify the Lightning peer
+		// to open channels with.
+		//
+		// Production bootstrap:
+		//   1. Choose a well-connected routing node as your peer.
+		//   2. Open the first channel manually:
+		//        lncli connect <pubkey>@<host>
+		//        lncli openchannel --node_key <pubkey> --local_amt <sats>
+		//   3. Once that channel is live, leave these fields EMPTY — the treasury
+		//      worker auto-discovers pubkey and host from ListChannels/ListPeers.
+		//
+		// Only populate these fields to let the code open channel #1 itself
+		// (useful for automated testnet/regtest environments).
+		LNDChannelPeerPubKey string `toml:"lnd_channel_peer_pubkey" env:"GIFTER_TREASURY_LND_CHANNEL_PEER_PUBKEY"`
+		LNDChannelPeerHost   string `toml:"lnd_channel_peer_host"   env:"GIFTER_TREASURY_LND_CHANNEL_PEER_HOST"`
+
+		// LNDChannelThresholdSats triggers a channel-open when the LND on-chain
+		// confirmed balance exceeds this value (satoshis).
+		LNDChannelThresholdSats int64 `toml:"lnd_channel_threshold_sats" env:"GIFTER_TREASURY_LND_CHANNEL_THRESHOLD_SATS"`
+
+		// LNDChannelTargetSats is the on-chain balance to keep in LND after opening
+		// a channel. Channel size = confirmed_balance - LNDChannelTargetSats.
+		LNDChannelTargetSats int64 `toml:"lnd_channel_target_sats" env:"GIFTER_TREASURY_LND_CHANNEL_TARGET_SATS"`
 	} `toml:"treasury"`
 }

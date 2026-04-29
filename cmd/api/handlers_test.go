@@ -77,7 +77,7 @@ func TestCreateCard_Success(t *testing.T) {
 		},
 	}
 
-	body := `{"FiatAmountCents":10000,"FiatCurrency":"USD","PurchasePriceCents":10500,"PurchaseEmail":"buyer@test.com"}`
+	body := `{"fiat_amount_cents":10000,"fiat_currency":"USD","purchase_price_cents":10500,"purchase_email":"buyer@test.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
@@ -116,7 +116,7 @@ func TestCreateCard_ServiceValidationError(t *testing.T) {
 		},
 	}
 
-	body := `{"FiatAmountCents":10000,"FiatCurrency":"XYZ","PurchasePriceCents":10500,"PurchaseEmail":"a@b.com"}`
+	body := `{"fiat_amount_cents":10000,"fiat_currency":"XYZ","purchase_price_cents":10500,"purchase_email":"a@b.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
@@ -132,7 +132,7 @@ func TestCreateCard_ServiceUnknownError(t *testing.T) {
 		},
 	}
 
-	body := `{"FiatAmountCents":10000,"FiatCurrency":"USD","PurchasePriceCents":10500,"PurchaseEmail":"a@b.com"}`
+	body := `{"fiat_amount_cents":10000,"fiat_currency":"USD","purchase_price_cents":10500,"purchase_email":"a@b.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 

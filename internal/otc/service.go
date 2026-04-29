@@ -12,6 +12,13 @@ type CryptocomService interface {
 	// submitting a quote request via WebSocket.
 	GetOTCInstruments(ctx context.Context) ([]OTCInstrument, error)
 
+	// RequestQuote connects to the Crypto.com private WebSocket, authenticates,
+	// subscribes to user.otc_qr.quotes, and blocks until a Quote with a matching
+	// ClQuoteReqID arrives. The returned Quote expires within seconds — call
+	// RequestDeal immediately.
+	// ctx should carry a deadline of ~30 seconds.
+	RequestQuote(ctx context.Context, params RequestQuoteParams) (*Quote, error)
+
 	// RequestDeal executes an OTC deal against an active quote received via the
 	// user.otc_qr.quotes WebSocket channel.
 	// params.QuoteID and the exact leg prices must be copied verbatim from the

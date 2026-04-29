@@ -99,7 +99,7 @@ func NewProvider(providerName string, baseURL string, httpClient *http.Client) (
 		case "cryptocom":
 			baseURL = cryptocompBaseURL
 		default:
-			return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp)", providerName)
+			return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp, cryptocom)", providerName)
 		}
 	}
 
@@ -114,7 +114,7 @@ func NewProvider(providerName string, baseURL string, httpClient *http.Client) (
 	case "cryptocom":
 		return &cryptocom{httpClient: httpClient, baseURL: baseURL}, nil
 	default:
-		return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp)", providerName)
+		return nil, fmt.Errorf("unknown provider: %s (supported: coinbase, coingecko, bitstamp, cryptocom)", providerName)
 	}
 }
 
@@ -234,7 +234,7 @@ func (c *cryptocom) GetPrice(ctx context.Context, fiatCurrency string) (float64,
 	// Decode response into struct{ Result struct{ Data []struct{ A string `json:"a"` } `json:"data"` } `json:"result"` }.
 	// Parse Data[0].A (last trade price) with strconv.ParseFloat, validate > 0, return.
 	fiatCurrency = strings.ToUpper(fiatCurrency)
-	apiURL := fmt.Sprintf("%s/public/get-tickers?instrument_namd=BTC_%s", c.baseURL, fiatCurrency)
+	apiURL := fmt.Sprintf("%s/public/get-tickers?instrument_name=BTC_%s", c.baseURL, fiatCurrency)
 
 	var response cryptocomPriceResponse
 	if err := fetchJSON(ctx, c.httpClient, apiURL, &response); err != nil {

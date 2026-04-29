@@ -36,19 +36,45 @@ type TransactionListResponse struct {
 	} `json:"meta"`
 }
 
-// TransferRequest is the body for initiating an outbound bank transfer.
-// Reference is used as an idempotency key — safe to retry with the same value.
+// TransferRequest is the body for POST /sepa/transfers (Qonto v2 API).
+//
+// Before calling SendTransfer, the client automatically calls POST /sepa/verify_payee
+// using BeneficiaryIBAN + BeneficiaryName and injects the resulting proof_token.
+// Set X-Qonto-Idempotency-Key is set to Transfer.Reference automatically.
+//
+// API reference: https://docs.qonto.com/api-reference/business-api/payments-transfers/sepa-transfers/sepa-transfers/create
 type TransferRequest struct {
-	DebtorIBAN   string `json:"debtor_iban"`   // our Qonto IBAN
-	CreditorIBAN string `json:"creditor_iban"` // Crypto.com OTC IBAN
-	CreditorName string `json:"creditor_name"` // beneficiary legal name
-	AmountCents  int64  `json:"amount_cents"`  // amount to transfer in cents
-	Currency     string `json:"currency"`      // "EUR"
-	Reference    string `json:"reference"`     // idempotency key + audit trail
+	// VopProofToken is injected by SendTransfer from the verify_payee response.
+	// Populate it directly only if you already hold a pre-obtained token.
+	VopProofToken string `json:"vop_proof_token,omitempty"`
+
+	// Transfer contains the payment details sent to Qonto.
+	Transfer TransferDetails `json:"transfer"`
+
+	// BeneficiaryIBAN and BeneficiaryName are used by SendTransfer to call
+	// POST /sepa/verify_payee before the transfer. They are NOT sent to Qonto
+	// as part of the transfer body (json:"-").
+	BeneficiaryIBAN string `json:"-"`
+	BeneficiaryName string `json:"-"`
+}
+
+// TransferDetails holds the per-transfer payment fields.
+type TransferDetails struct {
+	BankAccountID string `json:"bank_account_id"`          // source Qonto account UUID
+	Amount        string `json:"amount"`                   // decimal string e.g. "1100.50"
+	Currency      string `json:"currency"`                 // "EUR"
+	BeneficiaryID string `json:"beneficiary_id,omitempty"` // pre-saved beneficiary UUID
+	Reference     string `json:"reference"`                // free-text; also used as idempotency key
+	Note          string `json:"note,omitempty"`           // internal memo (not sent to recipient)
 }
 
 // TransferResponse is returned after a transfer is accepted by Qonto.
 type TransferResponse struct {
-	ID     string `json:"id"`
-	Status string `json:"status"` // "pending" | "completed"
+	Transfer struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"` // "pending" | "completed" | "declined"
+		Amount      string `json:"amount"` // decimal string
+		AmountCents int64  `json:"amount_cents"`
+		Reference   string `json:"reference"`
+	} `json:"transfer"`
 }
