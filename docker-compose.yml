@@ -37,13 +37,13 @@ networks:
 # Shared environment that points each service at the correct container hostnames
 # and LND credential paths. These override the localhost defaults in config.toml.
 x-app-env: &app-env
-  BTC_GIFTCARD_DB_HOST: gift-card-backend.db
-  BTC_GIFTCARD_DB_PORT: "5432"
-  BTC_GIFTCARD_REDIS_HOST: gift-card-backend.cache
-  BTC_GIFTCARD_REDIS_PORT: "6379"
-  BTC_GIFTCARD_LND_GRPC_HOST: gift-card-backend.lnd
-  BTC_GIFTCARD_LND_TLS_CERT_PATH: /app/lnd-creds/tls.cert
-  BTC_GIFTCARD_LND_MACAROON_PATH: /app/lnd-creds/admin.macaroon
+  GIFTER_DB_HOST: gift-card-backend.db
+  GIFTER_DB_PORT: "5432"
+  GIFTER_REDIS_HOST: gift-card-backend.cache
+  GIFTER_REDIS_PORT: "6379"
+  GIFTER_LND_GRPC_HOST: gift-card-backend.lnd
+  GIFTER_LND_TLS_CERT_PATH: /app/lnd-creds/tls.cert
+  GIFTER_LND_MACAROON_PATH: /app/lnd-creds/admin.macaroon
   CONFIG_FILE: /app/config.toml
 
 services:

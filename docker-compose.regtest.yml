@@ -96,11 +96,11 @@ services:
   # ----------------------------------------------------------------------------
   app:
     environment:
-      BTC_GIFTCARD_LND_NETWORK: regtest
+      GIFTER_LND_NETWORK: regtest
 
   worker_fund_card:
     environment:
-      BTC_GIFTCARD_LND_NETWORK: regtest
+      GIFTER_LND_NETWORK: regtest
 
   # ----------------------------------------------------------------------------
   # lnd_customer — simulates a customer's Lightning wallet in regtest.

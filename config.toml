@@ -26,13 +26,17 @@ payment_timeout_seconds = 30
 max_payment_fee_sats = 100
 
 [api]
+frontend_base_url = ""
 cors_origin = "*"
 
 [qonto]
 base_url = "https://thirdparty-sandbox.staging.qonto.co/v2"
 login = ""
 secret_key = ""
+webhook_secret = ""                                         # from Qonto Dashboard
 iban = ""
+bic = ""
+organization_slug = ""
 
 [cryptocom]
 base_url = "https://uat-api.3ona.co/exchange/v1/"
@@ -46,3 +50,18 @@ cryptocom_iban = ""
 cryptocom_name = ""
 purchase_floor_cents = 1000000
 purchase_target_cents = 500000
+
+[stripe]
+secret_key = ""
+public_key = ""                                            # sk_live_xxx after Stripe approval
+webhook_secret = ""                                        # from Stripe Dashboard → Webhooks
+success_endpoint = "success?session={CHECKOUT_SESSION_ID}"
+cancel_endpoint = "cancel"
+
+[fees]
+service_fee_pct = 3.0
+stripe_fee_pct = 1.5
+stripe_fee_flat_eur = 0.25
+crypto_spread_pct = 0.16
+sepa_fee_eur = 0.0
+payment_expiry_h = 24

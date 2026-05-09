@@ -23,7 +23,7 @@ func SetupTestDB(t *testing.T) *DB {
 		Port:            "5432",
 		User:            "postgres",
 		Password:        "postgres",
-		DB:              "btcgifter_test",
+		DB:              "btcgifter",
 		SslMode:         "disable",
 		MaxConns:        5,
 		MinConns:        1,

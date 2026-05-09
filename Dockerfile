@@ -18,7 +18,7 @@ RUN go mod download
 # -ldflags="-s -w" — strip symbol table and DWARF (~30% smaller).
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/api               ./cmd/api && \
-    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/fund_card_worker   ./cmd/worker/fund_card && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/fund_card_worker   ./cmd/worker/fund_card
 
 # ============================================================================
 # api — production runtime image for the HTTP API server.
