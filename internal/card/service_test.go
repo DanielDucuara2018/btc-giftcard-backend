@@ -4,6 +4,7 @@ package card
 
 import (
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/payment"
 	messages "btc-giftcard/internal/queue"
 	"btc-giftcard/pkg/logger"
 	streams "btc-giftcard/pkg/queue"
@@ -47,7 +48,7 @@ func setupTestService(t *testing.T) (*Service, *database.DB, *database.CardRepos
 	err := queue.DeclareStream(ctx, "fund_card", "test_workers")
 	require.NoError(t, err)
 
-	service := NewService(db, cardRepo, txRepo, "testnet", queue, nil)
+	service := NewService(db, cardRepo, txRepo, queue, nil, nil, nil)
 
 	return service, db, cardRepo, redisClient
 }
@@ -284,3 +285,182 @@ func TestService_generateCardCode_RetriesOnDuplicate(t *testing.T) {
 	// Verify the existing code is not in the generated codes
 	assert.NotContains(t, codes, "GIFT-TEST-CODE-0001")
 }
+
+// ============================================================================
+// HandleCheckoutEvent tests
+// ============================================================================
+
+// testCard returns a minimal Card ready for insertion. PaymentReference and
+// PaymentStatus are set so the card can be matched by GetByStripeSessionID.
+func testCard(sessionID string, code string) *database.Card {
+	ref := sessionID
+	return &database.Card{
+		ID:                 uuid.New().String(),
+		PurchaseEmail:      "buyer@test.com",
+		OwnerEmail:         "buyer@test.com",
+		Code:               code,
+		BTCAmountSats:      0,
+		FiatAmountCents:    5000,
+		FiatCurrency:       "EUR",
+		PurchasePriceCents: 5200,
+		PaymentReference:   &ref,
+		PaymentStatus:      database.PaymentPending,
+		Status:             database.Created,
+		CreatedAt:          time.Now().UTC(),
+	}
+}
+
+// TestHandleCheckoutEvent_NilCheckoutSession verifies the nil-guard: an event
+// with no CheckoutSession is silently ignored (returns nil, no DB calls made).
+func TestHandleCheckoutEvent_NilCheckoutSession(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	err := service.HandleCheckoutEvent(context.Background(), &payment.Event{
+		Type:            payment.EventCheckoutCompleted,
+		CheckoutSession: nil,
+	})
+	require.NoError(t, err)
+}
+
+// TestHandleCheckoutEvent_UnknownEventType verifies that events with an
+// unrecognised type are ignored without error.
+func TestHandleCheckoutEvent_UnknownEventType(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	err := service.HandleCheckoutEvent(context.Background(), &payment.Event{
+		Type:            "customer.subscription.created",
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: "cs_test_unknown"},
+	})
+	require.NoError(t, err)
+}
+
+// TestHandleCheckoutEvent_EmptyCards verifies that a completed event for a
+// session with no cards is a no-op (returns nil).
+func TestHandleCheckoutEvent_EmptyCards(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	err := service.HandleCheckoutEvent(context.Background(), &payment.Event{
+		Type:            payment.EventCheckoutCompleted,
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: "cs_nonexistent_session"},
+	})
+	require.NoError(t, err)
+}
+
+// TestHandleCheckoutEvent_Completed verifies the happy path: payment_status is
+// updated to "paid" and fund_card messages are published for each card.
+func TestHandleCheckoutEvent_Completed(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+	sessionID := "cs_test_completed_" + uuid.New().String()[:8]
+
+	card1 := testCard(sessionID, "GIFT-HCEV-C001-AAAA")
+	card2 := testCard(sessionID, "GIFT-HCEV-C002-BBBB")
+	require.NoError(t, cardRepo.Create(ctx, card1))
+	require.NoError(t, cardRepo.Create(ctx, card2))
+
+	err := service.HandleCheckoutEvent(ctx, &payment.Event{
+		Type:            payment.EventCheckoutCompleted,
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: sessionID},
+	})
+	require.NoError(t, err)
+
+	// Both cards must now be paid.
+	cards, err := cardRepo.GetByStripeSessionID(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, cards, 2)
+	for _, c := range cards {
+		assert.Equal(t, database.PaymentPaid, c.PaymentStatus)
+	}
+}
+
+// TestHandleCheckoutEvent_Completed_Idempotency verifies that a second completed
+// event for an already-paid session is a no-op.
+func TestHandleCheckoutEvent_Completed_Idempotency(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+	sessionID := "cs_test_idem_" + uuid.New().String()[:8]
+
+	card := testCard(sessionID, "GIFT-HCEV-IDEM-CCCC")
+	card.PaymentStatus = database.PaymentPaid // already paid
+	require.NoError(t, cardRepo.Create(ctx, card))
+
+	// First call — should be a no-op since card is already paid.
+	err := service.HandleCheckoutEvent(ctx, &payment.Event{
+		Type:            payment.EventCheckoutCompleted,
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: sessionID},
+	})
+	require.NoError(t, err)
+
+	// Status must still be paid (not changed again).
+	cards, err := cardRepo.GetByStripeSessionID(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, cards, 1)
+	assert.Equal(t, database.PaymentPaid, cards[0].PaymentStatus)
+}
+
+// TestHandleCheckoutEvent_Expired verifies that an expired event sets
+// payment_status to "expired" on all cards in the session.
+func TestHandleCheckoutEvent_Expired(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+	sessionID := "cs_test_expired_" + uuid.New().String()[:8]
+
+	card1 := testCard(sessionID, "GIFT-HCEV-E001-DDDD")
+	card2 := testCard(sessionID, "GIFT-HCEV-E002-EEEE")
+	require.NoError(t, cardRepo.Create(ctx, card1))
+	require.NoError(t, cardRepo.Create(ctx, card2))
+
+	err := service.HandleCheckoutEvent(ctx, &payment.Event{
+		Type:            payment.EventCheckoutExpired,
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: sessionID},
+	})
+	require.NoError(t, err)
+
+	cards, err := cardRepo.GetByStripeSessionID(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, cards, 2)
+	for _, c := range cards {
+		assert.Equal(t, database.PaymentExpired, c.PaymentStatus)
+	}
+}
+
+// TestHandleCheckoutEvent_Expired_EmptyCards verifies that an expired event
+// for a non-existent session is silently ignored.
+func TestHandleCheckoutEvent_Expired_EmptyCards(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	err := service.HandleCheckoutEvent(context.Background(), &payment.Event{
+		Type:            payment.EventCheckoutExpired,
+		CheckoutSession: &payment.CheckoutSessionPayload{ID: "cs_ghost_session"},
+	})
+	require.NoError(t, err)
+}
+
+// Prevent "imported and not used" errors if the compiler optimises away
+// any of the helper imports above.
+var _ = messages.FundCardMessage{}
+var _ = streams.NewStreamQueue

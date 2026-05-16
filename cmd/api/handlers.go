@@ -9,6 +9,7 @@ import (
 
 	"btc-giftcard/internal/card"
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/payment"
 )
 
 // cardServicer is the interface satisfied by *card.Service.
@@ -21,6 +22,12 @@ type cardServicer interface {
 	GetCardBalance(ctx context.Context, cardID string) (int64, error)
 	ValidateCardCode(ctx context.Context, code string) (database.CardStatus, error)
 	GetTreasuryAvailableBalance(ctx context.Context) (int64, error)
+	HandleCheckoutEvent(ctx context.Context, event *payment.Event) error
+}
+
+type stripeClient interface {
+	CreateCheckoutSession(ctx context.Context, req payment.CreateCheckoutRequest) (*payment.CheckoutSession, error)
+	ConstructEvent(rawBody []byte, sigHeader string) (*payment.Event, error)
 }
 
 // ============================================================================
@@ -32,9 +39,11 @@ type cardServicer interface {
 // Request body:
 //
 //	{
-//	  "fiat_amount_cents": 10000,
-//	  "fiat_currency": "USD",
-//	  "purchase_price_cents": 10500,
+//	  "items": [
+//	    {"fiat_amount_cents": 10000, "quantity": 50},
+//	    {"fiat_amount_cents":  5000, "quantity": 20}
+//	  ],
+//	  "fiat_currency": "EUR",
 //	  "purchase_email": "buyer@mail.com",
 //	  "user_id": "optional-uuid"
 //	}
@@ -42,11 +51,10 @@ type cardServicer interface {
 // Response 201:
 //
 //	{
-//	  "card_id": "uuid",
-//	  "code": "GIFT-XXXX-YYYY-ZZZZ",
-//	  "btc_amount_sats": 0,
-//	  "status": "created",
-//	  "created_at": "2026-03-05T12:00:00Z"
+//	  "cards": [{"card_id": "uuid", "code": "GIFT-XXXX-YYYY-ZZZZ"}, ...],
+//	  "checkout_url": "https://checkout.stripe.com/...",
+//	  "session_id": "cs_live_...",
+//	  "expires_at": "2026-03-05T12:00:00Z"
 //	}
 func (h *handler) createCard(w http.ResponseWriter, r *http.Request) {
 	var req card.CreateCardRequest

@@ -8,12 +8,13 @@ import (
 
 // handler holds dependencies for all HTTP endpoint handlers.
 type handler struct {
-	cardService cardServicer
-	lndClient   lnd.LightningClient
+	cardService  cardServicer
+	lndClient    lnd.LightningClient
+	stripeClient stripeClient
 }
 
-func newHandler(cardService cardServicer, lndClient lnd.LightningClient) *handler {
-	return &handler{cardService: cardService, lndClient: lndClient}
+func newHandler(cardService cardServicer, lndClient lnd.LightningClient, stripeClient stripeClient) *handler {
+	return &handler{cardService: cardService, lndClient: lndClient, stripeClient: stripeClient}
 }
 
 // registerCardRoutes registers card CRUD and redemption endpoints.
@@ -62,6 +63,11 @@ func (h *handler) registerNodeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /node/peers", h.connectPeer)
 }
 
+func (h *handler) registerPaymentRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /webhook/stripe", h.cardPayment)
+	// mux.HandleFunc("POST /webhook/qonto", h.bankTransferPayment)
+}
+
 // routes builds the HTTP router and wraps it with the middleware chain.
 //
 // Middleware order (outermost → innermost):
@@ -79,6 +85,7 @@ func (h *handler) routes() http.Handler {
 	h.registerCardRoutes(apiV1)
 	h.registerTreasuryRoutes(apiV1)
 	h.registerNodeRoutes(apiV1)
+	h.registerPaymentRoutes(apiV1)
 
 	root.Handle("/api/", http.StripPrefix("/api", apiV1))
 	root.HandleFunc("GET /health", h.healthCheck)

@@ -1,6 +1,6 @@
 # BTC Gift Card Service - Implementation Roadmap
 
-**Last Updated:** July 2025  
+**Last Updated:** May 2026  
 **Status:** Phase 1 partially complete, Phase 3-4 core done — HTTP API complete, Lightning-only redemption
 
 ---
@@ -51,59 +51,455 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 - ✅ **GetTreasuryAvailableBalance** — Redis-cached (10s TTL) for API endpoints
 - ✅ Treasury distributed locking (Redis SETNX 5s TTL) + per-card locks (10s TTL)
 - ✅ `computeTreasuryBalance` — uncached authoritative balance for write paths
-- ✅ 14 sentinel errors, string-based enums, `CreateCardFiatCurrency` (USD/EUR)
+- ✅ `PurchasePriceCents` removed — `ErrInvalidPurchase` removed, `CreateCardRequest` cleaned up
+- ✅ 13 sentinel errors, string-based enums, `CreateCardFiatCurrency` (USD/EUR)
 
 ### Workers
 - ✅ **fund_card worker** — thin adapter delegating to `card.Service.FundCard()`
 
 ### Database
-- ✅ String-based enums: `CardStatus`, `TransactionType`, `TransactionStatus`
+- ✅ String-based enums: `CardStatus`, `CardPaymentStatus`, `TransactionType`, `TransactionStatus`
 - ✅ Custodial model: no wallet-per-card, cards are balance claims on treasury
 - ✅ Redemption fields on transactions table (method, payment_hash, preimage, invoice)
 - ✅ CardRepository (Create, GetByCode, GetByID, Update, ListByUserID, GetTotalReservedBalance)
 - ✅ TransactionRepository (Create, GetByID, GetByTxHash, ListByCardID, Update)
+- ✅ `migrations/000001_initial_schema.up.sql` — full payment + fee columns added
+- ✅ `migrations/000001_initial_schema.down.sql` — drops all indexes, tables, and types cleanly
+- ✅ `internal/database/model.go` — `Card` struct aligned with new schema (payment fields + fee snapshot)
+
+### Configuration & Infrastructure
+- ✅ `config/api.go` — Stripe, Fees, Qonto (login/secret_key/iban/bic/org_slug/webhook), FrontendBaseURL, helper methods
+- ✅ `config.toml` — `[stripe]`, `[fees]`, `[qonto]` sections added
+- ✅ `.env` — Stripe (sk_test + pk_test), Qonto sandbox, Frontend base URL
+- ✅ `.env.example` — complete with all sections
+- ✅ Docker env vars renamed `BTC_GIFTCARD_*` → `GIFTER_*` across all compose files
+- ✅ `go.mod` / `go.sum` — `github.com/stripe/stripe-go/v82` added
+
+### Fee Management (`internal/fees/calculator.go`)
+- ✅ `Method` type (`card` | `bank_transfer`) with `IsValid()`
+- ✅ `Breakdown` struct with all atomic fee fields matching DB schema
+- ✅ `Calculate(faceValueCents, method, cfg)` — pure function, unit-testable
+- ✅ Handles card fees (Stripe % + flat) and bank transfer fees (SEPA only) separately
 
 ---
 
-## Phase 1: MVP Launch (On-Chain) - Weeks 1-2
+## Phase 1: MVP Launch - Weeks 1-2
 
-**Goal:** Launch minimal viable product with on-chain Bitcoin only
+**Goal:** Launch minimal viable product — Lightning redemption, hybrid payment intake (card + SEPA)
 
-### 1.1 Payment Integration - Direct Bank Transfers
+### 1.1 Payment Integration — Hybrid Strategy (Card Processor + Qonto Direct)
 
-**Priority:** HIGH  
-**Cost Impact:** €0 vs €250 (Stripe fees for 1000 cards)
+**Priority:** HIGH
 
-- [ ] **Set up business bank account**
-  - **Primary recommendation:** Qonto (French-regulated, API on all plans, SEPA instant by default)
-  - **Alternative:** Revolut Business Company plan (full API access, `POST /pay` endpoint)
-  - **Backup:** Wise Business (multi-currency, low FX fees, SEPA + SWIFT support)
-  - See **Decision Point #2** and **Appendix A** for full comparison
-  - Enable SEPA instant transfers
-  - Configure webhook/callback notifications
-  - Document account details for customer instructions
+#### Payment method selection rationale
 
-- [ ] **Implement semi-manual bank transfer reconciliation**
-  - Create `internal/payment/reconciliation.go`
-  - Read bank CSV exports (30 min/day task)
-  - Match transfers to pending cards by reference ID
-  - Update card status: pending → funded
-  - Send funding message to Redis queue
-  - **Estimated effort:** 4-6 hours implementation
+Two customer payment methods need to be supported: card payments and bank transfers (SEPA).
+They require different infrastructure because they carry different costs and flows:
 
-- [ ] **Create admin dashboard for reconciliation**
-  - Upload CSV endpoint
-  - Match/unmatch interface
-  - Manual override for edge cases
-  - Reconciliation history log
-  - **Estimated effort:** 8-10 hours
+| Method | Route | Fee | Settlement | Treasury impact |
+|---|---|---|---|---|
+| Card (Visa/MC) | Card processor → payout → Qonto | 1.4–1.8% + €0.25 | T+1 | Payout batched daily to Qonto |
+| Bank transfer (SEPA) | Customer → Qonto directly | €0 (SEPA Instant free with Qonto) | Instant | Funds in Qonto immediately |
 
-- [ ] **Update CreateCard API to include payment instructions**
-  - Add bank account details to response
-  - Generate unique reference ID for each card
-  - Add payment deadline (24 hours)
-  - Email payment instructions to customer
-  - **Estimated effort:** 2-3 hours
+**Key insight:** routing SEPA bank transfers through a card processor is both slower (payout delay)
+and more expensive (adds 0.8% cap fee). For bank transfers, Qonto is the right endpoint — customers
+send directly to the Qonto IBAN with a unique reference code per card.
+
+#### Card processor selection
+
+For card payments, a processor is required. This section provides a verified, up-to-date (May 2026)
+deep comparison of all relevant EU-focused options. See also **Decision Point #3** for the final verdict.
+
+##### Fee comparison (verified live rates)
+
+| Provider | EEA consumer card | EEA commercial card | UK card | Non-EEA card | Monthly fee | Dispute fee | SEPA Direct Debit |
+|---|---|---|---|---|---|---|---|
+| **Stripe** | 1.50% + €0.25 | 1.90% + €0.25 | 2.50% + €0.25 | 3.25% + €0.25 | €0 | €20 | €0.35 flat |
+| **Mollie** | 1.80% + €0.25 | 2.90% + €0.25 | — | 3.25% + €0.25 | €0 | n/a | €0.35 flat |
+| **PayPlug Starter** | 1.50% + €0.25 | 2.50% + €0.25 | — | 2.90% + €0.25 | **€10** | n/a | n/a |
+| **PayPlug Pro** | **1.10% + €0.25** | 2.50% + €0.25 | — | 2.90% + €0.25 | **€30** | n/a | n/a |
+| **Adyen** | Interchange++ (~1.2–1.4%) + €0.30 | Same IC++ | IC++ | IC++ | ~€120 min | ~€15 | IC++ |
+| **Checkout.com** | Custom (IC++ or flat) | Custom | Custom | Custom | Custom | Custom | Custom |
+| **Braintree (PayPal)** | ~1.90% + €0.30 | ~1.90% + €0.30 | ~2.40% + €0.30 | ~3.40% + €0.30 | €0 | $15 | n/a |
+
+> IC++ = interchange plus plus (real interchange cost + acquirer fee + scheme fee) — cheaper at scale,
+> complex to predict for budgeting.
+
+##### Break-even: PayPlug Pro vs Mollie
+
+PayPlug Pro saves 0.7% per transaction (1.1% vs 1.8%) but costs €30/month extra.
+Break-even: `€30 / 0.007 = €4,285/month` in card volume.
+Below ~€4k/month card volume → Mollie is cheaper total. Above → PayPlug Pro wins on fees.
+But PayPlug is bank-backed (BPCE group) — see crypto policy below.
+
+##### Cost per €100 card (EEA consumer, standard card)
+
+| Provider | Cost per transaction | Monthly fee amortised (100 cards/mo) |
+|---|---|---|
+| Stripe | €1.75 | — |
+| Mollie | €2.05 | — |
+| PayPlug Starter | €1.75 + €0.10 overhead | ≈ €1.85 |
+| PayPlug Pro | **€1.35** + €0.30 overhead | **≈ €1.65** |
+| Adyen | ≈ €1.50–€1.70 | + setup complexity |
+
+##### Crypto / gift card policy — CRITICAL evaluation
+
+This is the most important criterion for our use case.
+
+| Provider | Gift card policy | Crypto-adjacent policy | Risk level |
+|---|---|---|---|
+| **Stripe** | ⚠️ **RESTRICTED** — requires prior approval | ⚠️ **RESTRICTED** — Bitcoin exchanges/wallets need Stripe sales approval | 🔴 HIGH — dual restricted category |
+| **Mollie** | ✅ No explicit restriction found | ✅ Dutch EMI (DNB), generally permissive for EU fintech | 🟢 LOW |
+| **PayPlug** | ⚠️ Unknown | 🔴 BPCE banking group (conservative French bank) | 🟡 MEDIUM-HIGH |
+| **Adyen** | ✅ Enterprise onboarding review | ⚠️ Case-by-case review | 🟡 MEDIUM |
+| **Checkout.com** | ✅ Explicit Crypto solutions page | ✅ Actively supports crypto businesses | 🟢 LOW |
+| **Braintree (PayPal)** | ⚠️ Restricted | 🔴 PayPal explicitly prohibits most crypto services | 🔴 HIGH |
+
+**Stripe restriction detail (verified from Stripe's legal page, July 2025):**  
+BTC gift cards touch **two** Stripe restricted categories:
+1. `Non-fiat currency and stored value` → `"Pre-loaded payment cards, gift cards, virtual credits"` — **Restricted**
+2. `Cryptocurrency` → `"Bitcoin, Ripple, Ethereum... exchanges and wallets"` — **Restricted (Limited availability)**
+
+Stripe restricted ≠ banned. It means Stripe *can* allow it after manual review and approval.
+Without explicit approval: account termination risk during any automated compliance review.
+With approval from Stripe sales: normal operation, but ongoing compliance monitoring.
+
+**Conclusion:** Stripe CAN work if you contact sales and get explicit written approval before launch.
+The risk of using Stripe without approval is a sudden account suspension mid-operation.
+
+##### Sandbox & developer experience
+
+| Provider | Sandbox | Go SDK | Webhook testing | DX rating |
+|---|---|---|---|---|
+| **Stripe** | ✅ Excellent (CLI, dashboard replay, test cards) | ✅ Official `stripe-go` | ✅ CLI listener, dashboard replay | ⭐⭐⭐⭐⭐ |
+| **Mollie** | ✅ Full test environment, test API key | ⚠️ Community `mollie-api-go` | ✅ Test mode sends real webhook | ⭐⭐⭐⭐ |
+| **PayPlug** | ✅ Portal sandbox | ❌ REST only, no SDK | ⚠️ Basic | ⭐⭐⭐ |
+| **Adyen** | ✅ Test environment | ✅ Official Go SDK | ✅ Test webhooks | ⭐⭐⭐⭐ |
+| **Checkout.com** | ✅ Test account available | ❌ REST only | ✅ Webhook tester | ⭐⭐⭐⭐ |
+| **Braintree** | ✅ Sandbox | ✅ Official Go SDK | ✅ | ⭐⭐⭐⭐ |
+
+##### Payout schedule to Qonto
+
+| Provider | Default payout | Configurable | Minimum payout |
+|---|---|---|---|
+| **Stripe** | T+2 (rolling) | T+2 to T+7 depending on country | None |
+| **Mollie** | Daily / weekly / monthly (your choice) | ✅ Very flexible | None |
+| **PayPlug** | ~T+2 | Limited | None |
+| **Checkout.com** | Custom (T+1 to T+2 typical) | ✅ | Custom |
+
+All processors pay out via SEPA to any EU IBAN — Qonto IBAN works fine with all of them.
+
+##### Summary: pros and cons
+
+**Stripe**
+- ✅ Cheapest standard EU card rate: 1.5% + €0.25
+- ✅ Best developer experience in the industry (CLI, docs, test tools)
+- ✅ Official Go SDK with full type coverage
+- ✅ No monthly fee
+- ⚠️ BTC gift cards = RESTRICTED — requires explicit prior approval from Stripe sales team
+- ⚠️ Dual restricted category (stored value + crypto) = heightened compliance monitoring
+- ❌ Risk of sudden account suspension if operating without explicit approval
+
+**Mollie**
+- ✅ No explicit restriction on gift cards or crypto-adjacent businesses
+- ✅ Dutch EMI (DNB-licensed) — strong EU/EEA compliance without crypto prejudice
+- ✅ No monthly fee, cancel anytime
+- ✅ Flexible daily payout schedule
+- ✅ Full sandbox with real webhook delivery in test mode
+- ⚠️ EU consumer card fee slightly higher than Stripe: 1.8% vs 1.5% (+0.3%)
+- ⚠️ Community Go SDK (not official) — stable but fewer updates than Stripe's
+
+**PayPlug**
+- ✅ Cheapest at Pro tier for French consumer cards: 1.1% + €0.25
+- ✅ French-regulated, BPCE group backing (strong compliance reputation)
+- ✅ Fast onboarding for French businesses
+- ❌ €10–€30/month subscription even at low volume
+- ❌ BPCE banking group = likely to reject crypto-adjacent businesses on KYB review
+- ❌ No Go SDK, weaker webhook infrastructure
+
+**Checkout.com**
+- ✅ Explicitly supports crypto businesses (dedicated crypto solutions page)
+- ✅ Best option if/when volume exceeds €50k/month
+- ✅ Interchange++ pricing can be cheapest at scale
+- ❌ Enterprise-only — requires custom pricing negotiation
+- ❌ Minimum processing volume (not suitable for startup phase)
+- ❌ No public pricing, months to onboard
+
+**Adyen**
+- ✅ Cheapest at high volume (IC++ ~1.2-1.4%)
+- ✅ Strong EU compliance record
+- ❌ €120+/month minimum fees
+- ❌ Complex enterprise onboarding (weeks to months)
+- ❌ Not suitable until > €50k/month card volume
+
+**Braintree (PayPal)**
+- ❌ PayPal explicitly restricts crypto-related products
+- ❌ Most expensive EU rate (~1.9% + €0.30)
+- ❌ PayPal brand = customer confusion (users think they're paying via PayPal)
+
+##### ✅ Decision: Stripe (with prior sales approval) + Checkout.com at scale
+
+> **DECIDED (May 2026):** Stripe is the card payment processor for this project.
+> **Mandatory pre-launch step:** Contact Stripe sales and obtain written approval for the stored-value
+> + crypto-adjacent restricted categories before going live. Without this approval, sudden account
+> termination risk is real. With approval: normal operation, standard Stripe monitoring.
+
+**Phase 1 (MVP — Stripe):**
+- Best-in-class developer experience: CLI, official `stripe-go` SDK, dashboard webhook replay
+- EEA consumer card rate: 1.5% + €0.25 — cheapest standard rate of all compared providers
+- No monthly fee
+- Official Go SDK (`github.com/stripe/stripe-go/v82`) with full type coverage
+- Sandbox test cards + CLI listener for local webhook development
+- SEPA payout to Qonto IBAN at T+2
+- ⚠️ **ACTION REQUIRED before launch:** Contact Stripe sales, explain business model (fiat gift cards
+  that redeem BTC value), request written approval for stored-value + cryptocurrency categories
+
+**Phase 3+ (scale — > €50k/month card volume): Checkout.com or Adyen**
+- Both support crypto explicitly; negotiate interchange++ pricing
+- Migration cost: ~8-12 hours (swap payment provider implementation behind the `Provider` interface)
+
+#### Treasury flow with hybrid approach
+
+```
+Card payment (Stripe):
+  Customer → Stripe Checkout → checkout.session.completed webhook → activate card
+                                              ↓ (daily SEPA payout, T+2)
+                                          Qonto account → Crypto.com OTC → BTC → LND
+
+SEPA bank transfer (Qonto direct):
+  Customer → Qonto IBAN (unique ref per card) → transaction.created webhook → activate card
+                                                        ↓ (already in Qonto, instant)
+                                                     Crypto.com OTC → BTC → LND
+```
+
+SEPA funds land in Qonto immediately and are available for OTC purchase without any payout delay.
+Card payments are batched by Stripe and paid out to Qonto at T+2 (rolling basis).
+
+The `treasury_monitor` worker already handles the Qonto → Crypto.com → LND pipeline.
+What's needed is the **payment intake layer** that gates card activation on payment confirmation.
+
+#### Card status flow
+
+```
+created (pending_payment)           [BTC amount locked at creation price]
+    │
+    ├── card payment  → Stripe webhook checkout.session.completed  ─┐
+    └── bank transfer → Qonto webhook transaction.created           ─┴→ active (FundCardMessage published)
+    │
+    └── no payment within 24h → expired (cron job)
+```
+
+#### Implementation tasks
+
+##### Step 0 — Pre-launch compliance (BLOCKING)
+
+- [ ] **Obtain Stripe written approval before going live**
+  - Contact Stripe sales: explain business model (customers pay EUR fiat → receive BTC gift card)
+  - Request explicit approval under `Non-fiat currency and stored value` + `Cryptocurrency` restricted categories
+  - Operate on test mode only until written approval is in hand
+  - **Estimated effort:** 1-2 days (waiting for Stripe response)
+
+##### Step 1 — Fee management foundation (do this first)
+
+- [x] **Add fee configuration to `config.toml`** ✅ Done
+  ```toml
+  [fees]
+  service_fee_pct     = 2.0    # our service margin (%)
+  stripe_fee_pct      = 1.5    # Stripe EEA consumer card fee (%)
+  stripe_fee_flat_eur = 0.25   # Stripe flat fee per transaction (€)
+  crypto_spread_pct   = 0.16   # Crypto.com OTC spread estimate (%)
+  sepa_fee_eur        = 0.0    # SEPA processing fee (€, currently 0 via Qonto)
+  payment_expiry_h    = 24     # hours before pending card expires
+  ```
+
+- [x] **Implement fee calculator** ✅ Done (`internal/fees/calculator.go`)
+  - `Method` type (`card` | `bank_transfer`) with `IsValid()`
+  - `Calculate(faceValueCents int64, method Method, cfg ApiConfig) (Breakdown, error)`
+  - `Breakdown`: `ServiceFeeCents`, `ProcessorFeeCents`, `ProcessorFeeFlatCents`,
+    `CryptoSpreadCents`, `SEPAFeeCents`, `TotalFeeCents`, `NetEURCents`
+  - For card: `processorFee = face * stripe_fee_pct/100 + stripe_fee_flat`; flat fee is card-only
+  - For bank_transfer: processor fees = 0, `SEPAFeeCents` applied
+  - `NetEURCents = FaceValueCents - TotalFeeCents`
+  - Unit-testable pure function — no external dependencies
+
+##### Step 2 — Database schema migrations
+
+- [x] **Extend `cards` table** ✅ Done (replaced `ALTER TABLE` approach with full schema in initial migration)
+  - `card_payment_status` ENUM type: `pending | paid | failed | expired`
+  - New columns: `payment_method`, `payment_reference` (UNIQUE), `payment_status`, `payment_expires_at`,
+    `stripe_checkout_url`, `sepa_reference`
+  - Fee snapshot columns: `service_fee_cents`, `processor_fee_cents`, `processor_fee_flat_cents`,
+    `crypto_spread_cents`, `sepa_fee_cents`, `total_fee_cents`, `stripe_fee_actual_cents` (async reconciliation),
+    `btc_price_eur_cents` (locked at creation)
+  - Indexes: `idx_cards_payment_status`, `idx_cards_payment_expires_at` (partial, WHERE NOT NULL)
+  - `purchase_price_cents` column removed — `fiat_amount_cents` is the gross face value; net is derived
+  - Down migration also updated to drop new indexes + `card_payment_status` type
+
+##### Step 3 — Stripe payment integration
+
+- [x] **Add Go dependency** ✅ Done
+  ```
+  go get github.com/stripe/stripe-go/v82
+  ```
+
+- [x] **Implement Stripe client** (`internal/payment/stripe.go`)
+  - Interface: `Provider` with `CreateCheckoutSession`, `ConstructEvent`
+  - `CreateCheckoutSession(ctx, req CreateCheckoutRequest) (*CheckoutSession, error)`
+    - Mode: `payment` (one-time only — no `subscription` or `setup`)
+    - `line_items`: one entry per denomination × quantity; a single session supports
+      multi-denomination bulk orders (e.g. 2 × €100 + 3 × €50 in one checkout)
+    - `metadata`: `{"purchase_email": "..."}` — stored for auditing/receipts only;
+      **no card identifiers are stored in Stripe metadata** — the DB is the source
+      of truth; cards are looked up by session ID via `GetByStripeSessionID`
+    - `success_url`, `cancel_url` from config
+    - `expires_at`: now + 24h (Stripe enforces payment deadline)
+    - Returns `session.ID` (stored as `payment_reference` on all cards in the order)
+      + `session.URL` (hosted checkout URL sent to the frontend)
+  - `ConstructEvent(rawBody []byte, sigHeader string) (*Event, error)`
+    - Wraps `webhook.ConstructEvent` from `stripe-go` — must receive raw request bytes
+    - Returns provider-agnostic `*Event{Type, CheckoutSession: &CheckoutSessionPayload{ID}}`
+    - `CheckoutSessionPayload` exposes only the session `ID` — no metadata fields;
+      the webhook handler must query the DB to resolve cards from the session ID
+  - Sandbox: set `stripe.Key = cfg.Stripe.SecretKey` (prefix `sk_test_` for sandbox)
+  - **Estimated effort:** 3-4 hours
+
+- [x] **Add `POST /webhook/stripe` endpoint** ✅ Done (`cmd/api/handlers_payment.go`)
+
+  **Architecture:**
+  - Handler (`cardPayment`) is thin: read raw body → `ConstructEvent` → `HandleCheckoutEvent` → `200 OK`
+  - All business logic lives in `Service.HandleCheckoutEvent` (`internal/card/service.go`)
+  - `CardRepository.UpdatePaymentStatus` executes `UPDATE cards SET payment_status = $2 WHERE payment_reference = $1`
+  - `updateCardPaymentStatus` private helper was intentionally omitted — `HandleCheckoutEvent` calls
+    `UpdatePaymentStatus` directly in both branches; a pass-through wrapper would add no value
+
+  **Layering:**
+  ```
+  Handler (handlers_payment.go)     Service (service.go)               Repo (card_repository.go)
+  ──────────────────────────────    ────────────────────────────────    ───────────────────────────
+  io.ReadAll(r.Body)
+  ConstructEvent(raw, sig)       →  HandleCheckoutEvent(ctx, event)
+                                      guard: event.CheckoutSession == nil → return nil
+                                      switch event.Type:
+                                        completed →                    →  GetByStripeSessionID
+                                                                          UpdatePaymentStatus(PaymentPaid)
+                                                                          Publish FundCardMessage ×N
+                                        expired   →                    →  GetByStripeSessionID
+                                                                          UpdatePaymentStatus(PaymentExpired)
+                                        (other)   → return nil
+  w.WriteHeader(200)
+  ```
+
+  **Key implementation notes:**
+  - `event.CheckoutSession` nil-guard at top of `HandleCheckoutEvent` — prevents panic on unknown event types
+  - `payment_reference` is written at card creation; webhook only updates `payment_status`
+  - Idempotency: `cards[0].PaymentStatus != PaymentPending` guard on `completed` path
+  - Always `200 OK` — Stripe retries on any non-2xx; processing errors are logged, not surfaced
+  - `stripeProvider` is passed through `newServer` → `newHandler` → `handler.stripeClient`
+
+##### Step 4 — Qonto SEPA webhook integration
+
+- [ ] **Add `POST /webhook/qonto` endpoint** (`cmd/api/handlers.go`)
+  - Verify HMAC-SHA256 signature: `hmac(body, GIFTER_QONTO_WEBHOOK_SECRET)` == `X-Qonto-Signature`
+  - Handle `transaction.created` for incoming bank transfers
+  - Match `transaction.label` or `transaction.reference` to `cards.sepa_reference`
+  - On match + amount >= `face_value_cents`: set `payment_status = "paid"`, publish `FundCardMessage`
+  - Idempotent: UNIQUE constraint on `payment_reference`; `transaction.id` stored as reference
+  - Handle partial amounts (< face_value): log warning, do NOT activate (customer underpaid)
+  - **Estimated effort:** 3 hours
+
+##### Step 5 — Update `POST /api/cards`
+
+- [x] **Remove `PurchasePriceCents` from `CreateCardRequest`** ✅ Done (`internal/card/service.go`)
+  - `PurchasePriceCents` was a manually-passed "total including fee" value — now removed
+  - `ErrInvalidPurchase` sentinel and its validation check removed
+  - `purchase_price_cents` DB column removed; fee columns (`service_fee_cents`, etc.) store the breakdown atomically
+
+- [ ] **Update card creation endpoint** (`cmd/api/handlers.go`)
+  - Accept: `fiat_amount_cents` (int, replaces the old `purchase_price_cents` input), `fiat_currency`
+    ("EUR" only for now), `payment_method` (`"card"` | `"sepa"`) — default `"card"`
+  - Calculate fee breakdown via `fees.Calculate(fiatAmountCents, method, cfg.Fees)`
+  - Fetch BTC price → compute `btc_amount_sats = netEURCents / btcPricePerEUR * 1e8`
+  - Generate SEPA reference: `BTCGIFT-{YYYYMMDD}-{8 random alphanumeric chars}`
+  - If `payment_method == "card"`: create Stripe Checkout Session
+  - Create card in DB: `status=created`, `payment_status=pending`, store fee snapshot
+  - Response:
+    ```json
+    {
+      "card_code": "XXXX-XXXX-XXXX",
+      "face_value_cents": 10000,
+      "btc_amount_sats": 95238,
+      "fee_breakdown": {
+        "service_fee_cents": 200,
+        "processor_fee_cents": 175,
+        "crypto_spread_cents": 16,
+        "total_fee_cents": 391,
+        "total_fee_pct": 3.91
+      },
+      "payment": {
+        "method": "card",
+        "checkout_url": "https://checkout.stripe.com/...",
+        "expires_at": "2026-05-04T12:00:00Z"
+      },
+      "bank_transfer": {
+        "iban": "FR76...",
+        "bic": "QNTOFRP1XXX",
+        "reference": "BTCGIFT-20260503-A4B7C9D2",
+        "amount_eur": "100.00"
+      }
+    }
+    ```
+  - **Estimated effort:** 3-4 hours
+
+##### Step 6 — Expiry worker
+
+- [ ] **Add card expiry cron** (`cmd/worker/expire_cards/main.go`)
+  - Runs every 15 minutes
+  - `UPDATE cards SET payment_status='expired', status='expired' WHERE payment_status='pending' AND payment_expires_at < now()`
+  - Log expired card codes for audit
+  - **Estimated effort:** 1-2 hours
+
+##### Step 7 — Configuration additions
+
+- [x] **Add to `.env` / `config.toml`** ✅ Done
+  ```toml
+  [stripe]
+  secret_key       = "sk_test_xxx"        # sk_live_xxx after Stripe approval
+  public_key       = "pk_test_xxx"
+  webhook_secret   = "whsec_xxx"          # from Stripe Dashboard → Webhooks
+  success_endpoint = "success?session={CHECKOUT_SESSION_ID}"
+  cancel_endpoint  = "cancel"
+
+  [qonto]
+  base_url          = "https://thirdparty.qonto.com/v2"
+  login             = "xxx"
+  secret_key        = "xxx"
+  webhook_secret    = "xxx"              # from Qonto Dashboard
+  iban              = "FR76..."           # Qonto account IBAN for incoming SEPA
+  bic               = "QNTOFRP1XXX"
+  organization_slug = "your-company-slug"
+  staging_token     = "xxx"             # Qonto sandbox staging token
+
+  [fees]
+  service_fee_pct     = 2.0
+  stripe_fee_pct      = 1.5
+  stripe_fee_flat_eur = 0.25
+  crypto_spread_pct   = 0.16
+  sepa_fee_eur        = 0.0
+  payment_expiry_h    = 24
+  ```
+
+- [ ] **Set up Stripe account**
+  - Create restricted API key with minimum permissions (Checkout read/write, Webhook read)
+  - Register webhook endpoint URL in Stripe Dashboard → Developers → Webhooks
+  - Subscribe to events: `checkout.session.completed`, `checkout.session.expired`
+  - Download webhook signing secret (`whsec_xxx`) — never the secret key
+  - Use `stripe listen --forward-to localhost:8080/webhook/stripe` for local development
+  - **Estimated effort:** 30 minutes + Stripe sales approval process
+
+- [x] **Set up Qonto webhook** ✅ Done
+  - Qonto sandbox account active (`GIFTER_QONTO_LOGIN`, `GIFTER_QONTO_SECRET_KEY`, `GIFTER_QONTO_IBAN` configured)
+  - Staging token configured (`GIFTER_QONTO_STAGING_TOKEN`)
+  - Webhook URL registration + `transaction.created` subscription: pending (requires deployed endpoint URL)
 
 ### 1.2 Treasury Management - Automated OTC Purchases (Crypto.com)
 
@@ -111,13 +507,10 @@ This roadmap outlines the implementation plan to transform our MVP into a produc
 **Cost Impact:** 0.16% (OTC) vs 3% (fiat onramp)  
 **Automation Level:** Fully automatable via Crypto.com Exchange API
 
-- [ ] **Set up Crypto.com Exchange account**
-  - Register for Crypto.com Exchange (not the app)
-  - Complete business KYC/AML verification
-  - Enable API access with HMAC-SHA256 authentication
-  - Whitelist treasury wallet address for withdrawals
-  - Set up UAT sandbox for testing: `https://uat-api.3ona.co/exchange/v1/`
-  - **Estimated effort:** 2-3 hours + KYC waiting time
+- [x] **Set up Crypto.com Exchange account** ✅ Done
+  - UAT sandbox configured (`GIFTER_CRYPTOCOM_BASE_URL`, `GIFTER_CRYPTOCOM_API_KEY`, `GIFTER_CRYPTOCOM_SECRET_KEY`)
+  - Production credentials also configured (commented out in `.env`)
+  - Whitelist treasury wallet address for withdrawals: pending (requires production LND on-chain address)
 
 - [ ] **Create treasury wallet system**
   - Database table: `treasury_wallets`
@@ -254,6 +647,158 @@ Three layers of defence are implemented or planned:
   - SQL injection testing
   - Rate limiting validation
   - **Estimated effort:** 6-8 hours
+
+---
+
+### 1.7 Fee Management & Transparent Pricing
+
+**Priority:** HIGH — must be implemented before Phase 1.1 payment integration
+
+#### The goal
+
+All costs must be embedded in the card price. A customer buying a **€100 card** sees exactly how
+much BTC they will receive **before** they pay. The card price is the face value; the BTC amount
+is calculated as face value minus all stacked fees.
+
+#### Fee stack
+
+```
+Face value (what customer pays)
+    - Service fee             (our margin, e.g., 2.0%)
+    - Stripe processing fee   (1.5% + €0.25 for EEA consumer card)
+    - Crypto.com OTC spread   (approx. 0.16%)
+    ─────────────────────────────────────────────────
+    = Net EUR available for BTC purchase
+
+Net EUR / BTC price (locked at card creation) = BTC sats credited to card
+```
+
+**Example: €100 card, EEA consumer card payment**
+
+| Component | Amount |
+|---|---|
+| Face value | €100.00 |
+| Service fee (2.0%) | −€2.00 |
+| Stripe fee (1.5% + €0.25) | −€1.75 |
+| Crypto.com spread (0.16%) | −€0.16 |
+| **Net EUR for BTC** | **€96.09** |
+| BTC at €95,000/BTC | **≈ 101,147 sats** |
+
+For SEPA bank transfers: Stripe fee is replaced by `sepa_fee_eur = €0.00` (Qonto has no incoming
+SEPA fee), so customers get more BTC per euro with bank transfer.
+
+#### Feasibility: yes, fully parameterizable
+
+Stripe's fee per transaction is: `face_value * stripe_fee_pct/100 + stripe_fee_flat_eur`.
+All four fee components are deterministic at card creation time. The fee config is loaded from
+`config.toml` and snapshot-stored in the `cards.fee_snapshot` JSONB column at creation time.
+Changing the config does not retroactively affect existing cards — each card carries its own
+immutable fee record.
+
+#### Implementation tasks
+
+- [x] **Fee config section in `config.toml`** (covered in Phase 1.1 Step 1)
+  ```toml
+  [fees]
+  service_fee_pct     = 2.0
+  stripe_fee_pct      = 1.5
+  stripe_fee_flat_eur = 0.25
+  crypto_spread_pct   = 0.16
+  sepa_fee_eur        = 0.0
+  payment_expiry_h    = 24
+  ```
+
+- [x] **Implement `internal/fees/calculator.go`** ✅ Done (covered in Phase 1.1 Step 1)
+  - `Method` type, `Breakdown` struct, `Calculate()` pure function
+  - SEPA path: skip Stripe fees, apply `sepa_fee_eur` only
+  - All amounts in integer cents to avoid float rounding errors
+
+- [ ] **Return fee breakdown in `POST /api/cards` response**
+  - Customer sees exact fee breakdown and resulting BTC amount before any payment
+  - `fee_breakdown.total_fee_pct` rendered as "You receive X% of your payment as BTC"
+  - `fee_breakdown.btc_amount_sats` rendered in both sats and fiat equivalent
+
+- [x] **Fee snapshot columns** ✅ Done (atomic columns chosen over JSONB `fee_snapshot`)
+  - DB stores: `service_fee_cents`, `processor_fee_cents`, `processor_fee_flat_cents`,
+    `crypto_spread_cents`, `sepa_fee_cents`, `total_fee_cents`, `btc_price_eur_cents`
+  - All columns are NOT NULL with DEFAULT 0 — completeness enforced at DB level
+  - SQL-aggregatable (unlike JSONB) — enables fee revenue queries without JSON extraction
+  - Async reconciliation: `stripe_fee_actual_cents` populated after T+1 settlement
+
+- [ ] **BTC price locking**
+  - BTC price is fetched and locked at `POST /api/cards` time, NOT at webhook receipt time
+  - Rationale: customer sees and agrees to exact BTC amount before paying
+  - Risk: if customer delays 24h and price surges, we honor the locked amount (we absorb the loss)
+  - Mitigation: 24h expiry window limits exposure; price drift risk is small for small card values
+  - Store locked price in `fee_snapshot.btc_price_per_eur`
+
+- [ ] **Admin visibility**
+  - `GET /api/treasury/balance` response should include fee config summary (operator only)
+  - Daily fee revenue metric: sum of `total_fee_cents` over paid cards in the last 24h
+
+---
+
+### 1.6 API Security & Access Control
+
+**Priority:** HIGH — operator endpoints are currently unprotected
+
+#### The public API concern
+
+The frontend and backend being publicly accessible is correct architecture — the frontend
+needs to call the backend, and exposing the API publicly is unavoidable and safe **as long as
+each endpoint is appropriately gated.** The risk is not that the API is public; it is that
+some endpoints are not restricted enough.
+
+#### Route classification
+
+| Route | Who can call | Protection |
+|---|---|---|
+| `POST /webhook/mollie` | Mollie servers only | Mollie signature verification |
+| `POST /webhook/qonto` | Qonto servers only | Qonto signature verification |
+| `POST /api/cards` | Anyone who just paid | One-time payment token (see below) |
+| `POST /api/cards/{code}/redeem` | Card holder (knows the code) | Code is the secret |
+| `GET /api/cards/{code}` | Anyone | Code is the secret |
+| `GET /api/cards/{code}/balance` | Anyone | Code is the secret |
+| `GET /api/cards/{code}/validate` | Anyone | Code is the secret |
+| `GET /api/treasury/balance` | Operator only | API key |
+| `GET /api/node/*` | Operator only | API key |
+| `POST /api/node/*` | Operator only | API key |
+
+#### Implementation tasks
+
+- [ ] **Operator API key middleware** (`internal/middleware/apikey.go`)
+  - Read `GIFTER_OPERATOR_API_KEY` from env at startup
+  - Middleware checks `Authorization: Bearer <key>` on `/api/node/*` and `/api/treasury/*`
+  - Returns `401` on missing or wrong key, `403` if key is present but route is operator-only
+  - **Estimated effort:** 1-2 hours (highest priority, closes LND node exposure immediately)
+
+- [ ] **Payment token for `POST /api/cards`**
+  - After Mollie `payment.paid` webhook is received, generate a short-lived signed token
+    - HMAC-SHA256(secret, `payment_id + card_code + expiry_unix`)
+    - TTL: 10 minutes
+    - Stored in Redis with `SET payment_token:{token} card_code EX 600`
+  - Return token to frontend via the Mollie `redirectURL` as a query param
+    (e.g. `https://app.example.com/success?token=xxx`)
+  - Frontend calls `POST /api/cards` with `Authorization: Bearer <token>`
+  - Middleware validates token, looks up card code from Redis, allows request, deletes token (single-use)
+  - For SEPA bank transfer: token is generated by the Qonto webhook handler on reconciliation
+  - **Estimated effort:** 3-4 hours
+
+- [ ] **Webhook signature verification**
+  - Mollie: verify `X-Mollie-Signature` HMAC header against `GIFTER_MOLLIE_WEBHOOK_SECRET`
+  - Qonto: verify request origin against Qonto's published IP allowlist
+  - Both webhook endpoints return `200 OK` immediately (Mollie retries on non-2xx)
+  - **Estimated effort:** 2 hours
+
+- [ ] **Add to `.env` / `config.toml`**
+  ```toml
+  [api]
+  operator_api_key      = ""   # set in production; blank disables operator routes in dev
+  payment_token_secret  = ""   # HMAC key for one-time payment tokens
+
+  [mollie]
+  webhook_secret = ""          # from Mollie dashboard
+  ```
 
 ---
 
@@ -805,20 +1350,34 @@ Three layers of defence are implemented or planned:
    - **Criteria:** Revenue > €2,500, operational stability, team capacity
 
 2. **Bank Transfer Provider**
-   - ⏳ Decision: Qonto vs Revolut Business vs Wise Business vs bunq?
-   - **Recommendation:** Qonto (French-regulated, API on all plans, fully automated SEPA to trusted beneficiaries, instant SEPA by default)
-   - See **Appendix A** below for full comparison
-   - **Criteria:** Webhook/notification support, API quality, SCA automation, monthly fees, SEPA instant support
+   - ✅ Decision: **Qonto** — French-regulated, API on all plans, SEPA instant, webhook on incoming transactions
+   - SEPA bank transfers go **directly to Qonto** — no intermediary processor needed
+   - Qonto `transaction.created` webhook triggers card activation
 
-3. **Redemption Strategy**
+3. **Card Payment Processor**
+   - ✅ Decision: **Stripe** — chosen for best-in-class DX, official Go SDK, lowest EEA card rate
+   - **⚠️ MANDATORY pre-launch action:** Contact Stripe sales for written approval under:
+     1. `Non-fiat currency and stored value` → `"Pre-loaded payment cards, gift cards"` (Restricted)
+     2. `Cryptocurrency` → `"Bitcoin exchanges and wallets"` (Restricted, Limited availability)
+     - Operate in test/sandbox mode only until written approval is received
+     - With approval: standard operation, normal compliance monitoring
+     - Without approval: risk of account suspension mid-operation
+   - **Rate:** 1.5% + €0.25 for EEA consumer cards (cheapest standard rate of all compared providers)
+   - **SDK:** `github.com/stripe/stripe-go/v82` (official, full type coverage)
+   - **Webhook:** `POST /webhook/stripe` — `checkout.session.completed` event
+   - **Signature:** `stripe.ConstructEvent(rawBody, sig, whsec_xxx)` — SDK built-in HMAC verification
+   - **Payout:** T+2 rolling to Qonto IBAN
+   - **Scale path:** Checkout.com (explicit crypto support, IC++) when > €50k/month card volume
+
+5. **Redemption Strategy**
    - ⏳ Decision: Lightning-only or Lightning-first with on-chain fallback?
    - **Recommendation:** Lightning-first hybrid (reach 100% of users, push 85-90% to Lightning through UX)
    - **Why not Lightning-only?** Would exclude 20-40% of potential customers (exchange-only users, hardware wallets)
    - **Why not equal treatment?** Lightning is objectively better (instant, free) - make it the default
    - **Criteria:** Adoption metrics (track % choosing Lightning), customer feedback
 
-4. **OTC Provider Selection**
-   - ⏳ Decision: Crypto.com OTC vs Kraken OTC vs Binance OTC?
+6. **OTC Provider Selection**
+   - ✅ Decision: **Crypto.com OTC** — UAT sandbox + production credentials already configured
    - **Recommendation:** Crypto.com OTC (fully automatable API, RFQ flow, sandbox available)
    - **Comparison:**
 

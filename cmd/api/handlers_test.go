@@ -12,6 +12,7 @@ import (
 
 	"btc-giftcard/internal/card"
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/payment"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +29,7 @@ type mockCardService struct {
 	getCardBalance              func(context.Context, string) (int64, error)
 	validateCardCode            func(context.Context, string) (database.CardStatus, error)
 	getTreasuryAvailableBalance func(context.Context) (int64, error)
+	handleCheckoutEvent         func(context.Context, *payment.Event) error
 }
 
 func (m *mockCardService) CreateCard(ctx context.Context, req card.CreateCardRequest) (*card.CreateCardResponse, error) {
@@ -48,6 +50,9 @@ func (m *mockCardService) ValidateCardCode(ctx context.Context, code string) (da
 func (m *mockCardService) GetTreasuryAvailableBalance(ctx context.Context) (int64, error) {
 	return m.getTreasuryAvailableBalance(ctx)
 }
+func (m *mockCardService) HandleCheckoutEvent(ctx context.Context, event *payment.Event) error {
+	return m.handleCheckoutEvent(ctx, event)
+}
 
 // newTestHandler builds a handler with the given mock service.
 func newTestHandler(svc cardServicer) *handler {
@@ -61,23 +66,24 @@ func newTestHandler(svc cardServicer) *handler {
 func TestCreateCard_Success(t *testing.T) {
 	cardID := "card-uuid-1234"
 	code := "GIFT-TEST-ABCD-1234"
-	createdAt := time.Now().UTC()
+	expiresAt := time.Now().Add(24 * time.Hour).UTC()
 
 	svc := &mockCardService{
 		createCard: func(_ context.Context, req card.CreateCardRequest) (*card.CreateCardResponse, error) {
-			assert.Equal(t, int64(10000), req.FiatAmountCents)
-			assert.Equal(t, card.CreateCardFiatCurrency("USD"), req.FiatCurrency)
+			assert.Equal(t, 1, len(req.Items))
+			assert.Equal(t, int64(10000), req.Items[0].FiatAmountCents)
+			assert.Equal(t, 1, req.Items[0].Quantity)
+			assert.Equal(t, database.FiatCurrency("EUR"), req.FiatCurrency)
 			return &card.CreateCardResponse{
-				CardID:        cardID,
-				Code:          code,
-				BTCAmountSats: 0,
-				Status:        database.Created,
-				CreatedAt:     createdAt,
+				Cards:       []card.CreatedCard{{CardID: cardID, Code: code}},
+				CheckoutURL: "https://checkout.stripe.com/test",
+				SessionID:   "cs_test_123",
+				ExpiresAt:   expiresAt,
 			}, nil
 		},
 	}
 
-	body := `{"fiat_amount_cents":10000,"fiat_currency":"USD","purchase_price_cents":10500,"purchase_email":"buyer@test.com"}`
+	body := `{"items":[{"fiat_amount_cents":10000,"quantity":1}],"fiat_currency":"EUR","purchase_email":"buyer@test.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
@@ -88,8 +94,10 @@ func TestCreateCard_Success(t *testing.T) {
 
 	var resp card.CreateCardResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, cardID, resp.CardID)
-	assert.Equal(t, code, resp.Code)
+	assert.Equal(t, 1, len(resp.Cards))
+	assert.Equal(t, cardID, resp.Cards[0].CardID)
+	assert.Equal(t, code, resp.Cards[0].Code)
+	assert.Equal(t, "https://checkout.stripe.com/test", resp.CheckoutURL)
 }
 
 func TestCreateCard_BadJSON(t *testing.T) {
@@ -116,7 +124,7 @@ func TestCreateCard_ServiceValidationError(t *testing.T) {
 		},
 	}
 
-	body := `{"fiat_amount_cents":10000,"fiat_currency":"XYZ","purchase_price_cents":10500,"purchase_email":"a@b.com"}`
+	body := `{"fiat_amount_cents":10000,"fiat_currency":"XYZ","purchase_email":"a@b.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
@@ -132,7 +140,7 @@ func TestCreateCard_ServiceUnknownError(t *testing.T) {
 		},
 	}
 
-	body := `{"fiat_amount_cents":10000,"fiat_currency":"USD","purchase_price_cents":10500,"purchase_email":"a@b.com"}`
+	body := `{"fiat_amount_cents":10000,"fiat_currency":"USD","purchase_email":"a@b.com"}`
 	r := httptest.NewRequest("POST", "/api/cards", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 
@@ -455,4 +463,132 @@ func TestHealthCheck_ReturnsOK(t *testing.T) {
 	var body map[string]string
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.Equal(t, "ok", body["status"])
+}
+
+// ============================================================================
+// Mock stripe client
+// ============================================================================
+
+type mockStripeClient struct {
+	constructEvent        func(rawBody []byte, sigHeader string) (*payment.Event, error)
+	createCheckoutSession func(ctx context.Context, req payment.CreateCheckoutRequest) (*payment.CheckoutSession, error)
+}
+
+func (m *mockStripeClient) ConstructEvent(rawBody []byte, sigHeader string) (*payment.Event, error) {
+	if m.constructEvent != nil {
+		return m.constructEvent(rawBody, sigHeader)
+	}
+	return nil, nil
+}
+
+func (m *mockStripeClient) CreateCheckoutSession(ctx context.Context, req payment.CreateCheckoutRequest) (*payment.CheckoutSession, error) {
+	if m.createCheckoutSession != nil {
+		return m.createCheckoutSession(ctx, req)
+	}
+	return nil, nil
+}
+
+// ============================================================================
+// cardPayment webhook handler tests
+// ============================================================================
+
+// TestCardPayment_ConstructEventError verifies that a signature verification
+// failure stops processing and writes a 500 response (Stripe errors are not in
+// the known errorStatusMap so they fall through to the generic 500 handler).
+func TestCardPayment_ConstructEventError(t *testing.T) {
+	sc := &mockStripeClient{
+		constructEvent: func(_ []byte, _ string) (*payment.Event, error) {
+			return nil, fmt.Errorf("invalid webhook signature")
+		},
+	}
+	h := &handler{cardService: &mockCardService{}, stripeClient: sc}
+	r := httptest.NewRequest("POST", "/webhook/stripe", bytes.NewBufferString(`{}`))
+	r.Header.Set("Stripe-Signature", "t=1,v1=badhash")
+	w := httptest.NewRecorder()
+
+	h.cardPayment(w, r)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestCardPayment_ServiceError_StillReturns200 verifies the always-200 contract:
+// even when HandleCheckoutEvent fails, the handler returns 200 to prevent Stripe
+// from retrying a permanently-broken event.
+func TestCardPayment_ServiceError_StillReturns200(t *testing.T) {
+	sc := &mockStripeClient{
+		constructEvent: func(_ []byte, _ string) (*payment.Event, error) {
+			return &payment.Event{
+				Type:            payment.EventCheckoutCompleted,
+				CheckoutSession: &payment.CheckoutSessionPayload{ID: "cs_test_abc"},
+			}, nil
+		},
+	}
+	svc := &mockCardService{
+		handleCheckoutEvent: func(_ context.Context, _ *payment.Event) error {
+			return fmt.Errorf("database unavailable")
+		},
+	}
+	h := &handler{cardService: svc, stripeClient: sc}
+	r := httptest.NewRequest("POST", "/webhook/stripe", bytes.NewBufferString(`{}`))
+	w := httptest.NewRecorder()
+
+	h.cardPayment(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, w.Body.String(), "response body must be empty on success path")
+}
+
+// TestCardPayment_CompletedEvent_Success verifies the happy path for a completed
+// checkout event: 200 with no response body.
+func TestCardPayment_CompletedEvent_Success(t *testing.T) {
+	sessionID := "cs_test_success_001"
+	sc := &mockStripeClient{
+		constructEvent: func(_ []byte, _ string) (*payment.Event, error) {
+			return &payment.Event{
+				Type:            payment.EventCheckoutCompleted,
+				CheckoutSession: &payment.CheckoutSessionPayload{ID: sessionID},
+			}, nil
+		},
+	}
+	svc := &mockCardService{
+		handleCheckoutEvent: func(_ context.Context, e *payment.Event) error {
+			assert.Equal(t, sessionID, e.CheckoutSession.ID)
+			return nil
+		},
+	}
+	h := &handler{cardService: svc, stripeClient: sc}
+	r := httptest.NewRequest("POST", "/webhook/stripe", bytes.NewBufferString(`{}`))
+	w := httptest.NewRecorder()
+
+	h.cardPayment(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, w.Body.String())
+}
+
+// TestCardPayment_UnknownEventType_Returns200 verifies that events with no
+// CheckoutSession (e.g. payment_intent.created) are forwarded to the service
+// and still return 200.
+func TestCardPayment_UnknownEventType_Returns200(t *testing.T) {
+	sc := &mockStripeClient{
+		constructEvent: func(_ []byte, _ string) (*payment.Event, error) {
+			return &payment.Event{
+				Type:            "payment_intent.created",
+				CheckoutSession: nil,
+			}, nil
+		},
+	}
+	svc := &mockCardService{
+		handleCheckoutEvent: func(_ context.Context, e *payment.Event) error {
+			assert.Nil(t, e.CheckoutSession)
+			return nil
+		},
+	}
+	h := &handler{cardService: svc, stripeClient: sc}
+	r := httptest.NewRequest("POST", "/webhook/stripe", bytes.NewBufferString(`{}`))
+	w := httptest.NewRecorder()
+
+	h.cardPayment(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
 }

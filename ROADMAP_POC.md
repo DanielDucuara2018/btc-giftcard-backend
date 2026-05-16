@@ -325,7 +325,7 @@ docker compose up -d
 # Create a card
 CODE=$(curl -s -X POST http://localhost:3202/api/cards \
   -H "Content-Type: application/json" \
-  -d '{"fiat_amount_cents":1000,"fiat_currency":"USD","purchase_price_cents":1050,"purchase_email":"test@example.com"}' \
+  -d '{"fiat_amount_cents":1000,"fiat_currency":"EUR","purchase_email":"test@example.com"}' \
   | jq -r .code)
 
 # Wait for fund_card worker to activate it (~5s), then check balance
@@ -455,10 +455,9 @@ card lifecycle.
 curl -X POST http://localhost:3202/api/cards \
   -H "Content-Type: application/json" \
   -d '{
-    "fiat_amount_cents":    1000,
-    "fiat_currency":        "USD",
-    "purchase_price_cents": 1050,
-    "purchase_email":       "test@example.com"
+    "fiat_amount_cents": 1000,
+    "fiat_currency":     "EUR",
+    "purchase_email":    "test@example.com"
   }' | jq .
 ```
 
@@ -473,7 +472,7 @@ curl -X POST http://localhost:3202/api/cards \
 ```
 
 The `fund_card` worker picks up the job from Redis, fetches the current
-tBTC/USD price from Coinbase/CoinGecko, calculates satoshis, checks treasury
+BTC/EUR price from Coinbase/CoinGecko, calculates satoshis, checks treasury
 balance, and activates the card.
 
 ### B. Check the card is funded

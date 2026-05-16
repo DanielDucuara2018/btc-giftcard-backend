@@ -192,8 +192,9 @@ type APIError struct {
 var errorStatusMap = map[error]int{
 	card.ErrInvalidCurrency:   http.StatusBadRequest,
 	card.ErrInvalidFiatAmount: http.StatusBadRequest,
-	card.ErrInvalidPurchase:   http.StatusBadRequest,
 	card.ErrMissingEmail:      http.StatusBadRequest,
+	card.ErrEmptyItems:        http.StatusBadRequest,
+	card.ErrInvalidQuantity:   http.StatusBadRequest,
 	card.ErrCardNotFound:      http.StatusNotFound,
 	card.ErrCardNotActive:     http.StatusConflict,
 	card.ErrCardAlreadyUsed:   http.StatusConflict,

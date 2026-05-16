@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"btc-giftcard/internal/database"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,9 @@ import (
 
 // FundCardMessage represents a request to fund a gift card with BTC
 type FundCardMessage struct {
-	CardID          string `json:"card_id"`
-	FiatAmountCents int64  `json:"fiat_amount_cents"`
-	FiatCurrency    string `json:"fiat_currency"`
+	CardID             string                `json:"card_id"`
+	NetFiatAmountCents int64                 `json:"net_fiat_amount_cents"`
+	FiatCurrency       database.FiatCurrency `json:"fiat_currency"`
 }
 
 // ToJSON serializes the FundCardMessage to JSON bytes.
@@ -41,14 +42,14 @@ func (m *FundCardMessage) Validate() error {
 	if m.CardID == "" {
 		return errors.New("card_id is required")
 	}
-	if m.FiatAmountCents <= 0 {
+	if m.NetFiatAmountCents <= 0 {
 		return errors.New("fiat_amount_cents must be greater than 0")
 	}
 	if m.FiatCurrency == "" {
 		return errors.New("fiat_currency is required")
 	}
-	if len(m.FiatCurrency) != 3 {
-		return fmt.Errorf("fiat_currency must be 3 characters (got %q)", m.FiatCurrency)
+	if !m.FiatCurrency.IsValid() {
+		return fmt.Errorf("unsupported fiat currency %q", m.FiatCurrency)
 	}
 	return nil
 }

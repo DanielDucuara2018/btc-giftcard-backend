@@ -183,21 +183,34 @@ btc-giftcard/
 
 ### Cards
 
-| Column               | Type      | Description                                |
-|----------------------|-----------|--------------------------------------------|
-| id                   | UUID PK   | Card identifier                            |
-| user_id              | UUID NULL | Optional link to a user account            |
-| purchase_email       | TEXT      | Buyer's email (for delivery + verification)|
-| owner_email          | TEXT      | Current owner's email                      |
-| code                 | TEXT UQ   | Redemption code (e.g. GIFT-XXXX-YYYY-ZZZZ)|
-| btc_amount_sats      | BIGINT    | Remaining balance in satoshis              |
-| fiat_amount_cents    | BIGINT    | Face value in cents                        |
-| fiat_currency        | TEXT      | USD or EUR                                 |
-| purchase_price_cents | BIGINT    | Total charged (including fees)             |
-| status               | TEXT      | created / funding / active / redeemed / expired |
-| created_at           | TIMESTAMP | Card creation time                         |
-| funded_at            | TIMESTAMP | When balance was assigned                  |
-| redeemed_at          | TIMESTAMP | When balance reached zero                  |
+| Column                   | Type      | Description                                            |
+|--------------------------|-----------|--------------------------------------------------------|
+| id                       | UUID PK   | Card identifier                                        |
+| user_id                  | UUID NULL | Optional link to a user account                        |
+| purchase_email           | TEXT      | Buyer's email (for delivery + verification)            |
+| owner_email              | TEXT      | Current owner's email                                  |
+| code                     | TEXT UQ   | Redemption code (e.g. GIFT-XXXX-YYYY-ZZZZ)            |
+| btc_amount_sats          | BIGINT    | Remaining balance in satoshis                          |
+| fiat_amount_cents        | BIGINT    | Gross face value (what customer pays), in cents        |
+| fiat_currency            | VARCHAR(3)| Currency code (EUR)                                    |
+| status                   | ENUM      | created / funding / active / redeemed / expired        |
+| payment_method           | TEXT      | card \| bank_transfer                                  |
+| payment_reference        | TEXT UQ   | Stripe session ID or SEPA reference                    |
+| payment_status           | ENUM      | pending / paid / failed / expired                      |
+| payment_expires_at       | TIMESTAMPTZ | 24h payment window; NULL after payment confirmed     |
+| stripe_checkout_url      | TEXT NULL | Stripe hosted checkout URL (card payments only)        |
+| sepa_reference           | TEXT NULL | Random reference code for SEPA bank transfers          |
+| service_fee_cents        | BIGINT    | Platform service margin in cents                       |
+| processor_fee_cents      | BIGINT    | Stripe % fee in cents (0 for bank transfer)            |
+| processor_fee_flat_cents | BIGINT    | Stripe flat fee in cents (0 for bank transfer)         |
+| crypto_spread_cents      | BIGINT    | OTC spread estimate in cents                           |
+| sepa_fee_cents           | BIGINT    | SEPA processing fee (currently 0 via Qonto)            |
+| total_fee_cents          | BIGINT    | Sum of all fee columns                                 |
+| stripe_fee_actual_cents  | BIGINT    | Actual Stripe fee populated async after T+1 settlement |
+| btc_price_eur_cents      | BIGINT    | BTC/EUR price locked at card creation                  |
+| created_at               | TIMESTAMPTZ | Card creation time                                   |
+| funded_at                | TIMESTAMPTZ | When BTC balance was assigned                        |
+| redeemed_at              | TIMESTAMPTZ | When balance reached zero                            |
 
 ### Transactions
 

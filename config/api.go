@@ -52,16 +52,20 @@ type ApiConfig struct {
 	} `toml:"lnd"`
 
 	Api struct {
-		CorsOrigin string `toml:"cors_origin" env:"GIFTER_CORS_ORIGIN"`
+		CorsOrigin      string `toml:"cors_origin"       env:"GIFTER_CORS_ORIGIN"`
+		FrontendBaseURL string `toml:"frontend_base_url" env:"GIFTER_FRONTEND_BASE_URL"`
 	} `toml:"api"`
 
-	// Qonto banking API — fiat balance monitoring + SEPA transfers
+	// Qonto banking API — fiat balance monitoring + SEPA transfers + inbound webhook verification
 	Qonto struct {
-		BaseURL      string `toml:"base_url"       env:"GIFTER_QONTO_BASE_URL"`
-		Login        string `toml:"login"          env:"GIFTER_QONTO_LOGIN"`
-		SecretKey    string `toml:"secret_key"     env:"GIFTER_QONTO_SECRET_KEY"`
-		IBAN         string `toml:"iban"           env:"GIFTER_QONTO_IBAN"`
-		StagingToken string `toml:"staging_token" env:"GIFTER_QONTO_STAGING_TOKEN"`
+		BaseURL          string `toml:"base_url"          env:"GIFTER_QONTO_BASE_URL"`
+		Login            string `toml:"login"             env:"GIFTER_QONTO_LOGIN"`
+		SecretKey        string `toml:"secret_key"        env:"GIFTER_QONTO_SECRET_KEY"`
+		IBAN             string `toml:"iban"              env:"GIFTER_QONTO_IBAN"`
+		BIC              string `toml:"bic"               env:"GIFTER_QONTO_BIC"`
+		OrganizationSlug string `toml:"organization_slug" env:"GIFTER_QONTO_ORGANIZATION_SLUG"`
+		WebhookSecret    string `toml:"webhook_secret"    env:"GIFTER_QONTO_WEBHOOK_SECRET"`
+		StagingToken     string `toml:"staging_token"     env:"GIFTER_QONTO_STAGING_TOKEN"`
 	} `toml:"qonto"`
 
 	// CryptoCom exchange API — OTC BTC purchases + withdrawals
@@ -71,6 +75,25 @@ type ApiConfig struct {
 		SecretKey   string `toml:"secret_key" env:"GIFTER_CRYPTOCOM_SECRET_KEY"`
 		HTTPTimeout int    `toml:"http_timeout" env:"GIFTER_CRYPTOCOM_HTTP_TIMEOUT"  env-default:"15"`
 	} `toml:"cryptocom"`
+
+	// Stripe — card payment processing
+	Stripe struct {
+		SecretKey       string `toml:"secret_key"       env:"GIFTER_STRIPE_SECRET_KEY"`
+		PublicKey       string `toml:"public_key"       env:"GIFTER_STRIPE_PUBLIC_KEY"`
+		WebhookSecret   string `toml:"webhook_secret"   env:"GIFTER_STRIPE_WEBHOOK_SECRET"`
+		SuccessEndpoint string `toml:"success_endpoint" env:"GIFTER_STRIPE_SUCCESS_ENDPOINT"`
+		CancelEndpoint  string `toml:"cancel_endpoint"  env:"GIFTER_STRIPE_CANCEL_ENDPOINT"`
+	} `toml:"stripe"`
+
+	// Fees defines the fee stack embedded in every card price
+	Fees struct {
+		ServiceFeePct    float64 `toml:"service_fee_pct"     env:"GIFTER_FEES_SERVICE_FEE_PCT"    env-default:"3.0"`
+		StripeFeePct     float64 `toml:"stripe_fee_pct"      env:"GIFTER_FEES_STRIPE_FEE_PCT"     env-default:"1.5"`
+		StripeFeeFlatEUR float64 `toml:"stripe_fee_flat_eur" env:"GIFTER_FEES_STRIPE_FEE_FLAT"    env-default:"0.25"`
+		CryptoSpreadPct  float64 `toml:"crypto_spread_pct"   env:"GIFTER_FEES_CRYPTO_SPREAD_PCT"  env-default:"0.16"`
+		SEPAFeeEUR       float64 `toml:"sepa_fee_eur"        env:"GIFTER_FEES_SEPA_FEE"           env-default:"0.0"`
+		PaymentExpiryH   int     `toml:"payment_expiry_h"    env:"GIFTER_FEES_PAYMENT_EXPIRY_H"   env-default:"24"`
+	} `toml:"fees"`
 
 	// Treasury controls the automated fiat → BTC → LND pipeline
 	Treasury struct {
@@ -116,4 +139,15 @@ type ApiConfig struct {
 		// a channel. Channel size = confirmed_balance - LNDChannelTargetSats.
 		LNDChannelTargetSats int64 `toml:"lnd_channel_target_sats" env:"GIFTER_TREASURY_LND_CHANNEL_TARGET_SATS"`
 	} `toml:"treasury"`
+}
+
+// StripeSuccessURL returns the full redirect URL for successful Stripe Checkout sessions.
+// The {CHECKOUT_SESSION_ID} placeholder is replaced by Stripe before the redirect.
+func (c *ApiConfig) StripeSuccessURL() string {
+	return c.Api.FrontendBaseURL + "/" + c.Stripe.SuccessEndpoint
+}
+
+// StripeCancelURL returns the full redirect URL when a Stripe Checkout session is cancelled.
+func (c *ApiConfig) StripeCancelURL() string {
+	return c.Api.FrontendBaseURL + "/" + c.Stripe.CancelEndpoint
 }

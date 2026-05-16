@@ -19,7 +19,9 @@ import (
 	"btc-giftcard/config"
 	"btc-giftcard/internal/card"
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/fees"
 	"btc-giftcard/internal/lnd"
+	"btc-giftcard/internal/payment"
 	"btc-giftcard/pkg/cache"
 	"btc-giftcard/pkg/logger"
 	streams "btc-giftcard/pkg/queue"
@@ -82,9 +84,19 @@ func run() error {
 	cardRepo := database.NewCardRepository(db)
 	txRepo := database.NewTransactionRepository(db)
 	queue := streams.NewStreamQueue(cache.Client)
-	cardService := card.NewService(db, cardRepo, txRepo, Cfg.LND.Network, queue, lndClient)
+	stripeProvider := payment.NewStripeClient(payment.Config{
+		SecretKey:     Cfg.Stripe.SecretKey,
+		WebhookSecret: Cfg.Stripe.WebhookSecret,
+		SuccessURL:    Cfg.StripeSuccessURL(),
+		CancelURL:     Cfg.StripeCancelURL(),
+	})
+	var feesCfg *fees.Config
+	if err := copier.Copy(&feesCfg, &Cfg.Fees); err != nil {
+		return fmt.Errorf("failed to copy fees config: %w", err)
+	}
+	cardService := card.NewService(db, cardRepo, txRepo, queue, lndClient, stripeProvider, feesCfg)
 
-	srv := newServer(cardService, lndClient)
+	srv := newServer(cardService, lndClient, stripeProvider)
 
 	go func() {
 		logger.Info("API server starting", zap.String("addr", srv.Addr))
@@ -182,8 +194,8 @@ func initLND(ctx context.Context) (*lnd.Client, error) {
 
 // newServer creates the HTTP server with sensible timeouts.
 // TODO: Make port configurable via config.toml [api] section.
-func newServer(cardService *card.Service, lndClient *lnd.Client) *http.Server {
-	h := newHandler(cardService, lndClient)
+func newServer(cardService *card.Service, lndClient *lnd.Client, stripeProvider payment.Provider) *http.Server {
+	h := newHandler(cardService, lndClient, stripeProvider)
 	return &http.Server{
 		Addr:         ":3202",
 		Handler:      h.routes(),

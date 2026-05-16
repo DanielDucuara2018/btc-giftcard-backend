@@ -98,7 +98,7 @@ func run() error {
 	cardRepo := database.NewCardRepository(db)
 	txRepo := database.NewTransactionRepository(db)
 	queue := streams.NewStreamQueue(cache.Client)
-	cardService := card.NewService(db, cardRepo, txRepo, Cfg.LND.Network, queue, lndClient)
+	cardService := card.NewService(db, cardRepo, txRepo, queue, lndClient, nil, nil)
 	handler := newMessageHandler(cardService, provider)
 
 	if err := startConsumer(ctx, queue, handler); err != nil {
@@ -281,22 +281,22 @@ func (h *messageHandler) processMessage(ctx context.Context, messageID string, d
 	}
 	logger.Info("Received message",
 		zap.String("card_id", msg.CardID),
-		zap.Int64("fiat_amount_cents", msg.FiatAmountCents),
-		zap.String("fiat_currency", msg.FiatCurrency),
+		zap.Int64("fiat_amount_cents", msg.NetFiatAmountCents),
+		zap.String("fiat_currency", string(msg.FiatCurrency)),
 	)
 
 	// Step 2: Fetch BTC price from OTC provider
-	price, err := h.provider.GetPrice(ctx, msg.FiatCurrency)
+	price, err := h.provider.GetPrice(ctx, string(msg.FiatCurrency))
 	if err != nil {
 		return fmt.Errorf("error fetching BTC price: %w", err)
 	}
 	logger.Info("BTC price fetched",
 		zap.Float64("price", price),
-		zap.String("currency", msg.FiatCurrency),
+		zap.String("currency", string(msg.FiatCurrency)),
 	)
 
 	// Step 3: Calculate BTC amount in satoshis
-	fiatAmount := float64(msg.FiatAmountCents) / 100.0
+	fiatAmount := float64(msg.NetFiatAmountCents) / 100.0
 	btcAmount := fiatAmount / price
 	satoshis := int64(btcAmount * 100_000_000)
 	if satoshis <= 0 {

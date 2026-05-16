@@ -9,6 +9,8 @@ DROP INDEX IF EXISTS idx_transactions_card_id;
 -- Named unique constraints are dropped automatically with DROP TABLE below
 
 DROP INDEX IF EXISTS idx_cards_created_at;
+DROP INDEX IF EXISTS idx_cards_payment_expires_at;
+DROP INDEX IF EXISTS idx_cards_payment_status;
 DROP INDEX IF EXISTS idx_cards_status;
 DROP INDEX IF EXISTS idx_cards_purchase_email;
 DROP INDEX IF EXISTS idx_cards_owner_email;
@@ -22,6 +24,7 @@ DROP TABLE IF EXISTS cards;
 -- Drop custom types
 DROP TYPE IF EXISTS transaction_status;
 DROP TYPE IF EXISTS transaction_type;
+DROP TYPE IF EXISTS card_payment_status;
 DROP TYPE IF EXISTS card_status;
 
 -- Drop schema migrations table (optional - usually keep this)

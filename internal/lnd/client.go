@@ -59,15 +59,34 @@ import (
 // Config — LND connection settings (populated from config.toml [lnd] section)
 // ============================================================================
 
+// Network identifies the Bitcoin network an LND node is operating on.
+type Network string
+
+const (
+	Mainnet Network = "mainnet"
+	Testnet Network = "testnet"
+	Regtest Network = "regtest"
+)
+
+// IsValid returns true if n is a recognised Bitcoin network.
+func (n Network) IsValid() bool {
+	switch n {
+	case Mainnet, Testnet, Regtest:
+		return true
+	default:
+		return false
+	}
+}
+
 // IMPLEMENT:
 type Config struct {
-	GRPCHost              string // "localhost" or "gift-card-backend.lnd"
-	GRPCPort              string // 10009
-	TLSCertPath           string // Path to LND's tls.cert
-	MacaroonPath          string // Path to admin.macaroon (or custom-baked macaroon)
-	Network               string // "mainnet", "testnet", "regtest"
-	PaymentTimeoutSeconds int    // Max time for Lightning payment settlement (default: 30)
-	MaxPaymentFeeSats     int64  // Max routing fee in sats (default: 100)
+	GRPCHost              string  // "localhost" or "gift-card-backend.lnd"
+	GRPCPort              string  // 10009
+	TLSCertPath           string  // Path to LND's tls.cert
+	MacaroonPath          string  // Path to admin.macaroon (or custom-baked macaroon)
+	Network               Network // "mainnet", "testnet", "regtest"
+	PaymentTimeoutSeconds int     // Max time for Lightning payment settlement (default: 30)
+	MaxPaymentFeeSats     int64   // Max routing fee in sats (default: 100)
 }
 
 // ============================================================================
@@ -270,6 +289,10 @@ type Client struct {
 }
 
 func NewClient(cfg Config) (*Client, error) {
+	if !cfg.Network.IsValid() {
+		return nil, fmt.Errorf("invalid LND network %q: must be mainnet, testnet, or regtest", cfg.Network)
+	}
+
 	// NewClientTLSFromFile reads the PEM cert file and builds TLS credentials.
 	// First arg is the file path (not contents), second is the server name
 	// override ("" = use the name from the cert).

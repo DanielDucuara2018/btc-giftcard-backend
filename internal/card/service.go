@@ -2,7 +2,9 @@ package card
 
 import (
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/fees"
 	"btc-giftcard/internal/lnd"
+	"btc-giftcard/internal/payment"
 	messages "btc-giftcard/internal/queue"
 	"btc-giftcard/pkg/cache"
 	"btc-giftcard/pkg/logger"
@@ -23,18 +25,20 @@ import (
 // ============================================================================
 
 var (
-	ErrCardNotFound        = errors.New("card not found")
-	ErrCardNotActive       = errors.New("card is not active")
-	ErrCardAlreadyUsed     = errors.New("card has already been redeemed")
-	ErrInsufficientFunds   = errors.New("insufficient funds on card")
-	ErrInsufficientBalance = errors.New("insufficient treasury balance")
-	ErrTreasuryLockBusy    = errors.New("treasury lock is held by another process")
-	ErrInvalidMethod       = errors.New("invalid redeem method")
-	ErrLightningInvoice    = errors.New("lightning invoice is required")
-	ErrInvalidCurrency     = errors.New("unsupported fiat currency")
-	ErrInvalidFiatAmount   = errors.New("fiat amount must be positive")
-	ErrInvalidPurchase     = errors.New("purchase price must be positive")
-	ErrMissingEmail        = errors.New("purchase email is required")
+	ErrCardNotFound         = errors.New("card not found")
+	ErrCardNotActive        = errors.New("card is not active")
+	ErrCardAlreadyUsed      = errors.New("card has already been redeemed")
+	ErrInsufficientFunds    = errors.New("insufficient funds on card")
+	ErrInsufficientBalance  = errors.New("insufficient treasury balance")
+	ErrTreasuryLockBusy     = errors.New("treasury lock is held by another process")
+	ErrInvalidMethod        = errors.New("invalid redeem method")
+	ErrLightningInvoice     = errors.New("lightning invoice is required")
+	ErrInvalidCurrency      = errors.New("unsupported fiat currency")
+	ErrInvalidFiatAmount    = errors.New("fiat amount must be positive")
+	ErrMissingEmail         = errors.New("purchase email is required")
+	ErrEmptyItems           = errors.New("at least one item is required")
+	ErrInvalidQuantity      = errors.New("item quantity must be positive")
+	ErrInvalidPaymentMethod = errors.New("Invalid payment method")
 )
 
 // ============================================================================
@@ -67,12 +71,13 @@ const (
 //
 // Workers call: FundCard (fund_card worker).
 type Service struct {
-	db        *database.DB
-	cardRepo  *database.CardRepository
-	txRepo    *database.TransactionRepository
-	network   string // "testnet" or "mainnet"
-	queue     *streams.StreamQueue
-	lndClient *lnd.Client
+	db              *database.DB
+	cardRepo        *database.CardRepository
+	txRepo          *database.TransactionRepository
+	queue           *streams.StreamQueue
+	lndClient       *lnd.Client
+	paymentProvider payment.Provider
+	fees            *fees.Config
 }
 
 // NewService creates a new card service instance.
@@ -80,17 +85,19 @@ func NewService(
 	db *database.DB,
 	cardRepo *database.CardRepository,
 	txRepo *database.TransactionRepository,
-	network string,
 	queue *streams.StreamQueue,
 	lndClient *lnd.Client,
+	paymentProvider payment.Provider,
+	fees *fees.Config,
 ) *Service {
 	return &Service{
-		db:        db,
-		cardRepo:  cardRepo,
-		txRepo:    txRepo,
-		network:   network,
-		queue:     queue,
-		lndClient: lndClient,
+		db:              db,
+		cardRepo:        cardRepo,
+		txRepo:          txRepo,
+		queue:           queue,
+		lndClient:       lndClient,
+		paymentProvider: paymentProvider,
+		fees:            fees,
 	}
 }
 
@@ -100,137 +107,171 @@ func NewService(
 
 // --- Card lifecycle --------------------------------------------------------
 
-type CreateCardFiatCurrency string
-
-const (
-	USD CreateCardFiatCurrency = "USD"
-	EUR CreateCardFiatCurrency = "EUR"
-)
-
-// IsValid returns true if the currency is a supported fiat currency.
-func (c CreateCardFiatCurrency) IsValid() bool {
-	switch c {
-	case USD, EUR:
-		return true
-	default:
-		return false
-	}
+// CreateCardItem is one denomination + quantity in an order.
+type CreateCardItem struct {
+	FiatAmountCents int64 `json:"fiat_amount_cents"`
+	Quantity        int   `json:"quantity"`
 }
 
-// CreateCardRequest contains the parameters for creating a new gift card.
-// BTCAmountSats is NOT provided at creation — it will be calculated and set
-// by the fund_card worker based on the current BTC/fiat exchange rate.
+// CreateCardRequest contains the parameters for a bulk card order.
+// A single request creates N cards under one Stripe checkout session.
 type CreateCardRequest struct {
-	FiatAmountCents    int64                  `json:"fiat_amount_cents"`
-	FiatCurrency       CreateCardFiatCurrency `json:"fiat_currency"`
-	PurchasePriceCents int64                  `json:"purchase_price_cents"`
-	UserID             *string                `json:"user_id,omitempty"`
-	PurchaseEmail      string                 `json:"purchase_email"`
+	Items         []CreateCardItem       `json:"items"`
+	FiatCurrency  database.FiatCurrency  `json:"fiat_currency"`
+	UserID        *string                `json:"user_id,omitempty"`
+	PurchaseEmail string                 `json:"purchase_email"`
+	PaymentMethod database.PaymentMethod `json:"payment_method"`
 }
 
-// CreateCardResponse contains the created card details.
+// CreatedCard identifies one card within a bulk order response.
+type CreatedCard struct {
+	CardID string `json:"card_id"`
+	Code   string `json:"code"`
+}
+
+// CreateCardResponse is returned after a successful bulk card order.
+// All cards share one Stripe checkout session; payment is confirmed via webhook.
 type CreateCardResponse struct {
-	CardID        string              `json:"card_id"`
-	Code          string              `json:"code"`
-	BTCAmountSats int64               `json:"btc_amount_sats"`
-	Status        database.CardStatus `json:"status"`
-	CreatedAt     time.Time           `json:"created_at"`
+	Cards       []CreatedCard `json:"cards"`
+	CheckoutURL string        `json:"checkout_url"`
+	SessionID   string        `json:"session_id"`
+	ExpiresAt   time.Time     `json:"expires_at"`
 }
 
-// validateCreateRequest validates the create card request fields.
+// validateCreateRequest validates the bulk card order request.
 func (s *Service) validateCreateRequest(req CreateCardRequest) error {
 	if !req.FiatCurrency.IsValid() {
 		return ErrInvalidCurrency
 	}
-	if req.FiatAmountCents <= 0 {
-		return ErrInvalidFiatAmount
-	}
-	if req.PurchasePriceCents <= 0 {
-		return ErrInvalidPurchase
-	}
 	if req.PurchaseEmail == "" {
 		return ErrMissingEmail
+	}
+	if !req.PaymentMethod.IsValid() {
+		return ErrInvalidPaymentMethod
+	}
+	if len(req.Items) == 0 {
+		return ErrEmptyItems
+	}
+	for _, item := range req.Items {
+		if item.FiatAmountCents <= 0 {
+			return ErrInvalidFiatAmount
+		}
+		if item.Quantity <= 0 {
+			return ErrInvalidQuantity
+		}
 	}
 	return nil
 }
 
-// CreateCard creates a new gift card as a balance claim on the treasury.
-// No wallet or private key is generated — cards are custodial.
+// CreateCard creates N gift cards (potentially of different denominations) under
+// a single payment session. All cards share the same payment_reference and are
+// persisted with payment_status=pending.
 //
-// After persisting the card, it publishes a FundCardMessage to the "fund_card"
-// stream so a worker can fetch the BTC price and activate the card.
+// Payment method routing:
+//   - "card"          → Stripe hosted checkout. This method creates a Stripe
+//     session and returns a checkout_url for the frontend to
+//     redirect the buyer. Cards are activated by the
+//     POST /webhook/stripe handler on checkout.session.completed.
+//   - "bank_transfer" → SEPA via Qonto. No external session is created here;
+//     a SEPA reference is generated and returned so the buyer
+//     can initiate a bank transfer. Cards are activated by the
+//     POST /webhook/qonto handler when the matching inbound
+//     transfer is confirmed.
+//
+// In both cases, FundCardMessages are published by the respective webhook
+// handler — NOT here. Cards remain payment_status=pending until the webhook
+// fires.
+//
+// TODO: implement the "bank_transfer" branch (generate SEPA ref, skip Stripe).
 func (s *Service) CreateCard(ctx context.Context, req CreateCardRequest) (*CreateCardResponse, error) {
-	// 0. Validate request
+	// 1. Validate request
 	if err := s.validateCreateRequest(req); err != nil {
 		return nil, err
 	}
 
-	// 1. Generate a unique card code
-	code, err := s.generateCardCode(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate card code: %w", err)
-	}
-
-	// 2. Create Card struct (custodial model — no wallet, no keys)
-	// BTCAmountSats is 0 and will be set by the funding worker
-	// based on the current exchange rate when the card is funded.
-	card := &database.Card{
-		ID:                 uuid.New().String(),
-		UserID:             req.UserID,
-		PurchaseEmail:      req.PurchaseEmail,
-		OwnerEmail:         req.PurchaseEmail,
-		Code:               code,
-		BTCAmountSats:      0, // Will be set by funding worker based on current BTC price
-		FiatAmountCents:    req.FiatAmountCents,
-		FiatCurrency:       string(req.FiatCurrency),
-		PurchasePriceCents: req.PurchasePriceCents,
-		Status:             database.Created,
-		CreatedAt:          time.Now().UTC(),
-	}
-
-	// 3. Save card to database
-	err = s.cardRepo.Create(ctx, card)
-	if err != nil {
-		if errors.Is(err, database.ErrCardCodeExists) {
-			return nil, fmt.Errorf("card code collision (unexpected): %w", err)
-		}
-		return nil, fmt.Errorf("failed to save card: %w", err)
-	}
-
-	// 4. Publish FundCardMessage to queue (don't fail card creation if this fails)
-	msg := messages.FundCardMessage{
-		CardID:          card.ID,
-		FiatAmountCents: card.FiatAmountCents,
-		FiatCurrency:    card.FiatCurrency,
-	}
-
-	msgJSON, err := msg.ToJSON()
-	if err != nil {
-		logger.Error("Failed to serialize FundCardMessage",
-			zap.String("card_id", card.ID),
-			zap.Error(err),
-		)
-	} else {
-		_, err = s.queue.Publish(ctx, "fund_card", msgJSON)
-		if err != nil {
-			logger.Error("Failed to publish FundCardMessage",
-				zap.String("card_id", card.ID),
-				zap.Error(err),
-			)
-		} else {
-			logger.Info("Published FundCardMessage",
-				zap.String("card_id", card.ID),
-			)
+	// 2. Build one Stripe line item per denomination
+	checkoutItems := make([]payment.LineItem, len(req.Items))
+	for i, item := range req.Items {
+		checkoutItems[i] = payment.LineItem{
+			FaceValueCents: item.FiatAmountCents,
+			Quantity:       int64(item.Quantity),
+			Description:    fmt.Sprintf("Bitcoin Gift Card — %s %.2f", string(req.FiatCurrency), float64(item.FiatAmountCents)/100),
 		}
 	}
 
-	// 5. Return response
+	// 3. Create a single Stripe checkout session covering the entire order
+	session, err := s.paymentProvider.CreateCheckoutSession(ctx, payment.CreateCheckoutRequest{
+		Items:         checkoutItems,
+		PurchaseEmail: req.PurchaseEmail,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create checkout session: %w", err)
+	}
+
+	// 4. Generate card codes and build DB rows — all cards share the session ID
+	sessionID := session.ID
+	checkoutURL := session.URL
+	expiresAt := session.ExpiresAt
+
+	var dbCards []*database.Card
+	var created []CreatedCard
+	for _, item := range req.Items {
+		for i := 0; i < item.Quantity; i++ {
+			code, err := s.generateCardCode(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate card code: %w", err)
+			}
+			breakdown, err := fees.Calculate(item.FiatAmountCents, req.PaymentMethod, s.fees)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compute the fees for card code: %w", err)
+			}
+			id := uuid.New().String()
+			dbCards = append(dbCards, &database.Card{
+				ID:                    id,
+				UserID:                req.UserID,
+				PurchaseEmail:         req.PurchaseEmail,
+				OwnerEmail:            req.PurchaseEmail,
+				Code:                  code,
+				BTCAmountSats:         0,
+				FiatAmountCents:       item.FiatAmountCents,
+				FiatCurrency:          req.FiatCurrency,
+				PaymentMethod:         req.PaymentMethod,
+				PaymentReference:      &sessionID,
+				PaymentStatus:         database.PaymentPending,
+				PaymentExpiresAt:      &expiresAt,
+				StripeCheckoutURL:     &checkoutURL,
+				ServiceFeeCents:       breakdown.ServiceFeeCents,
+				ProcessorFeeCents:     breakdown.ProcessorFeeCents,
+				ProcessorFeeFlatCents: breakdown.ProcessorFeeFlatCents,
+				CryptoSpreadCents:     breakdown.CryptoSpreadCents,
+				SEPAFeeCents:          breakdown.SEPAFeeCents,
+				TotalFeeCents:         breakdown.TotalFeeCents,
+				Status:                database.Created,
+				CreatedAt:             time.Now().UTC(),
+			})
+			created = append(created, CreatedCard{CardID: id, Code: code})
+		}
+	}
+
+	// 5. Persist all cards atomically in a single transaction
+	if err := s.db.RunInTx(ctx, func(q database.Querier) error {
+		return s.cardRepo.WithTx(q).BulkCreate(ctx, dbCards)
+	}); err != nil {
+		return nil, fmt.Errorf("failed to save cards: %w", err)
+	}
+
+	// FundCardMessages are published by the webhook handler after Stripe confirms
+	// payment — NOT here. Cards are pending payment at this point.
+	logger.Info("Created pending card order",
+		zap.Int("card_count", len(created)),
+		zap.String("session_id", sessionID),
+	)
+
 	return &CreateCardResponse{
-		CardID:        card.ID,
-		Code:          card.Code,
-		BTCAmountSats: card.BTCAmountSats,
-		Status:        card.Status,
-		CreatedAt:     card.CreatedAt,
+		Cards:       created,
+		CheckoutURL: checkoutURL,
+		SessionID:   sessionID,
+		ExpiresAt:   expiresAt,
 	}, nil
 }
 
@@ -849,4 +890,67 @@ func (s *Service) generateCardCode(ctx context.Context) (string, error) {
 	}
 
 	return "", errors.New("failed to generate unique card code after 5 attempts")
+}
+
+func (s *Service) HandleCheckoutEvent(ctx context.Context, event *payment.Event) error {
+	if event.CheckoutSession == nil {
+		return nil
+	}
+	sessionID := event.CheckoutSession.ID
+	switch event.Type {
+	case payment.EventCheckoutCompleted:
+		cards, err := s.cardRepo.GetByStripeSessionID(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("failed to get cards for stripe session %s: %w", sessionID, err)
+		}
+
+		if len(cards) == 0 {
+			return nil
+		}
+
+		if cards[0].PaymentStatus != database.PaymentPending {
+			return nil
+		}
+
+		if err := s.cardRepo.UpdatePaymentStatus(ctx, sessionID, database.PaymentPaid); err != nil {
+			return fmt.Errorf("failed to update payment status for session %s: %w", sessionID, err)
+		}
+
+		for _, card := range cards {
+			msg := messages.FundCardMessage{CardID: card.ID, NetFiatAmountCents: card.FiatAmountCents - card.TotalFeeCents, FiatCurrency: card.FiatCurrency}
+			msgJSON, err := msg.ToJSON()
+			if err != nil {
+				logger.Error("Failed to serialize FundCardMessage",
+					zap.String("card_id", card.ID),
+					zap.Error(err),
+				)
+			} else {
+				_, err = s.queue.Publish(ctx, "fund_card", msgJSON)
+				if err != nil {
+					logger.Error("Failed to publish FundCardMessage",
+						zap.String("card_id", card.ID),
+						zap.Error(err),
+					)
+				} else {
+					logger.Info("Published FundCardMessage",
+						zap.String("card_id", card.ID),
+					)
+				}
+			}
+		}
+	case payment.EventCheckoutExpired:
+		cards, err := s.cardRepo.GetByStripeSessionID(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("failed to get cards for stripe session %s: %w", sessionID, err)
+		}
+
+		if len(cards) == 0 {
+			return nil
+		}
+
+		if err := s.cardRepo.UpdatePaymentStatus(ctx, sessionID, database.PaymentExpired); err != nil {
+			return fmt.Errorf("failed to update payment status for session %s: %w", sessionID, err)
+		}
+	}
+	return nil
 }

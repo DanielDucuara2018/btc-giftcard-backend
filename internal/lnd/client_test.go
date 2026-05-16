@@ -60,16 +60,42 @@ func TestConfig_DefaultValues(t *testing.T) {
 		GRPCPort:              "10009",
 		TLSCertPath:           "/path/to/tls.cert",
 		MacaroonPath:          "/path/to/admin.macaroon",
-		Network:               "testnet",
+		Network:               Testnet,
 		PaymentTimeoutSeconds: 30,
 		MaxPaymentFeeSats:     100,
 	}
 
 	assert.Equal(t, "localhost", cfg.GRPCHost)
 	assert.Equal(t, "10009", cfg.GRPCPort)
-	assert.Equal(t, "testnet", cfg.Network)
+	assert.Equal(t, Testnet, cfg.Network)
 	assert.Equal(t, 30, cfg.PaymentTimeoutSeconds)
 	assert.Equal(t, int64(100), cfg.MaxPaymentFeeSats)
+}
+
+// --- Network enum tests ---
+
+func TestNetwork_IsValid(t *testing.T) {
+	assert.True(t, Mainnet.IsValid())
+	assert.True(t, Testnet.IsValid())
+	assert.True(t, Regtest.IsValid())
+	assert.False(t, Network("").IsValid())
+	assert.False(t, Network("signet").IsValid())
+	assert.False(t, Network("TESTNET").IsValid()) // case-sensitive
+}
+
+func TestNewClient_InvalidNetwork(t *testing.T) {
+	cfg := Config{
+		GRPCHost:     "localhost",
+		GRPCPort:     "10009",
+		Network:      Network("signet"),
+		TLSCertPath:  "/any/path",
+		MacaroonPath: "/any/path",
+	}
+	client, err := NewClient(cfg)
+	assert.Nil(t, client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid LND network")
+	assert.Contains(t, err.Error(), "signet")
 }
 
 // --- NewClient error cases (no real LND needed) ---
@@ -80,6 +106,7 @@ func TestNewClient_InvalidTLSCertPath(t *testing.T) {
 		MacaroonPath: "/nonexistent/path/admin.macaroon",
 		GRPCHost:     "localhost",
 		GRPCPort:     "10009",
+		Network:      Testnet,
 	}
 
 	client, err := NewClient(cfg)
@@ -117,6 +144,7 @@ func TestNewClient_InvalidMacaroonPath(t *testing.T) {
 		MacaroonPath: "/nonexistent/path/admin.macaroon",
 		GRPCHost:     "localhost",
 		GRPCPort:     "10009",
+		Network:      Testnet,
 	}
 
 	client, err := NewClient(cfg)

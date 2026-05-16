@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"btc-giftcard/internal/database"
 	"encoding/json"
 	"testing"
 
@@ -14,9 +15,9 @@ import (
 
 func TestFundCardMessage_ToJSON(t *testing.T) {
 	msg := &FundCardMessage{
-		CardID:          "550e8400-e29b-41d4-a716-446655440000",
-		FiatAmountCents: 5000,
-		FiatCurrency:    "USD",
+		CardID:             "550e8400-e29b-41d4-a716-446655440000",
+		NetFiatAmountCents: 5000,
+		FiatCurrency:       "USD",
 	}
 
 	data, err := msg.ToJSON()
@@ -28,22 +29,22 @@ func TestFundCardMessage_ToJSON(t *testing.T) {
 	err = json.Unmarshal(data, &result)
 	require.NoError(t, err)
 	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", result["card_id"])
-	assert.Equal(t, float64(5000), result["fiat_amount_cents"])
+	assert.Equal(t, float64(5000), result["net_fiat_amount_cents"])
 	assert.Equal(t, "USD", result["fiat_currency"])
 }
 
 func TestFromJSONFundCard_Success(t *testing.T) {
 	jsonData := []byte(`{
 		"card_id": "550e8400-e29b-41d4-a716-446655440000",
-		"fiat_amount_cents": 10000,
+		"net_fiat_amount_cents": 10000,
 		"fiat_currency": "EUR"
 	}`)
 
 	msg, err := FromJSONFundCard(jsonData)
 	require.NoError(t, err)
 	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", msg.CardID)
-	assert.Equal(t, int64(10000), msg.FiatAmountCents)
-	assert.Equal(t, "EUR", msg.FiatCurrency)
+	assert.Equal(t, int64(10000), msg.NetFiatAmountCents)
+	assert.Equal(t, database.FiatEUR, msg.FiatCurrency)
 }
 
 func TestFromJSONFundCard_InvalidJSON(t *testing.T) {
@@ -63,33 +64,33 @@ func TestFromJSONFundCard_ValidationErrors(t *testing.T) {
 	}{
 		{
 			name:        "Missing card_id",
-			jsonData:    `{"fiat_amount_cents": 5000, "fiat_currency": "USD"}`,
+			jsonData:    `{"net_fiat_amount_cents": 5000, "fiat_currency": "USD"}`,
 			expectError: "card_id is required",
 		},
 		{
 			name:        "Missing fiat_currency",
-			jsonData:    `{"card_id": "123", "fiat_amount_cents": 5000}`,
+			jsonData:    `{"card_id": "123", "net_fiat_amount_cents": 5000}`,
 			expectError: "fiat_currency is required",
 		},
 		{
 			name:        "Zero amount",
-			jsonData:    `{"card_id": "123", "fiat_amount_cents": 0, "fiat_currency": "USD"}`,
+			jsonData:    `{"card_id": "123", "net_fiat_amount_cents": 0, "fiat_currency": "USD"}`,
 			expectError: "fiat_amount_cents must be greater than 0",
 		},
 		{
 			name:        "Negative amount",
-			jsonData:    `{"card_id": "123", "fiat_amount_cents": -100, "fiat_currency": "USD"}`,
+			jsonData:    `{"card_id": "123", "net_fiat_amount_cents": -100, "fiat_currency": "USD"}`,
 			expectError: "fiat_amount_cents must be greater than 0",
 		},
 		{
 			name:        "Invalid currency length",
-			jsonData:    `{"card_id": "123", "fiat_amount_cents": 5000, "fiat_currency": "US"}`,
-			expectError: "fiat_currency must be 3 characters",
+			jsonData:    `{"card_id": "123", "net_fiat_amount_cents": 5000, "fiat_currency": "US"}`,
+			expectError: "unsupported fiat currency",
 		},
 		{
 			name:        "Currency too long",
-			jsonData:    `{"card_id": "123", "fiat_amount_cents": 5000, "fiat_currency": "USDD"}`,
-			expectError: "fiat_currency must be 3 characters",
+			jsonData:    `{"card_id": "123", "net_fiat_amount_cents": 5000, "fiat_currency": "USDD"}`,
+			expectError: "unsupported fiat currency",
 		},
 	}
 
@@ -105,9 +106,9 @@ func TestFromJSONFundCard_ValidationErrors(t *testing.T) {
 
 func TestFundCardMessage_RoundTrip(t *testing.T) {
 	original := &FundCardMessage{
-		CardID:          "550e8400-e29b-41d4-a716-446655440000",
-		FiatAmountCents: 7500,
-		FiatCurrency:    "GBP",
+		CardID:             "550e8400-e29b-41d4-a716-446655440000",
+		NetFiatAmountCents: 7500,
+		FiatCurrency:       "EUR",
 	}
 
 	// Serialize
@@ -120,7 +121,7 @@ func TestFundCardMessage_RoundTrip(t *testing.T) {
 
 	// Compare
 	assert.Equal(t, original.CardID, msg.CardID)
-	assert.Equal(t, original.FiatAmountCents, msg.FiatAmountCents)
+	assert.Equal(t, original.NetFiatAmountCents, msg.NetFiatAmountCents)
 	assert.Equal(t, original.FiatCurrency, msg.FiatCurrency)
 }
 
@@ -134,18 +135,18 @@ func TestFundCardMessage_Validate(t *testing.T) {
 		{
 			name: "Valid message",
 			msg: &FundCardMessage{
-				CardID:          "123",
-				FiatAmountCents: 1000,
-				FiatCurrency:    "USD",
+				CardID:             "123",
+				NetFiatAmountCents: 1000,
+				FiatCurrency:       "USD",
 			},
 			expectError: false,
 		},
 		{
 			name: "Empty card_id",
 			msg: &FundCardMessage{
-				CardID:          "",
-				FiatAmountCents: 1000,
-				FiatCurrency:    "USD",
+				CardID:             "",
+				NetFiatAmountCents: 1000,
+				FiatCurrency:       "USD",
 			},
 			expectError: true,
 			errorText:   "card_id is required",
@@ -153,9 +154,9 @@ func TestFundCardMessage_Validate(t *testing.T) {
 		{
 			name: "Zero amount",
 			msg: &FundCardMessage{
-				CardID:          "123",
-				FiatAmountCents: 0,
-				FiatCurrency:    "USD",
+				CardID:             "123",
+				NetFiatAmountCents: 0,
+				FiatCurrency:       "USD",
 			},
 			expectError: true,
 			errorText:   "fiat_amount_cents must be greater than 0",
@@ -163,9 +164,9 @@ func TestFundCardMessage_Validate(t *testing.T) {
 		{
 			name: "Negative amount",
 			msg: &FundCardMessage{
-				CardID:          "123",
-				FiatAmountCents: -500,
-				FiatCurrency:    "USD",
+				CardID:             "123",
+				NetFiatAmountCents: -500,
+				FiatCurrency:       "USD",
 			},
 			expectError: true,
 			errorText:   "fiat_amount_cents must be greater than 0",
@@ -173,22 +174,22 @@ func TestFundCardMessage_Validate(t *testing.T) {
 		{
 			name: "Empty currency",
 			msg: &FundCardMessage{
-				CardID:          "123",
-				FiatAmountCents: 1000,
-				FiatCurrency:    "",
+				CardID:             "123",
+				NetFiatAmountCents: 1000,
+				FiatCurrency:       "",
 			},
 			expectError: true,
 			errorText:   "fiat_currency is required",
 		},
 		{
-			name: "Invalid currency length",
+			name: "Invalid currency",
 			msg: &FundCardMessage{
-				CardID:          "123",
-				FiatAmountCents: 1000,
-				FiatCurrency:    "US",
+				CardID:             "123",
+				NetFiatAmountCents: 1000,
+				FiatCurrency:       "GBP",
 			},
 			expectError: true,
-			errorText:   "fiat_currency must be 3 characters",
+			errorText:   "unsupported fiat currency",
 		},
 	}
 
