@@ -120,3 +120,31 @@ func TestConstructEvent_TamperedPayload(t *testing.T) {
 	_, err := c.ConstructEvent(tampered, header)
 	assert.Error(t, err)
 }
+
+// TestConstructEvent_APIVersionMismatch verifies that events forwarded by the
+// Stripe CLI (which uses the account's current API version rather than the SDK's
+// pinned version) are accepted without error. We only read session.ID from the
+// payload, so a version difference does not affect correctness.
+func TestConstructEvent_APIVersionMismatch(t *testing.T) {
+	c := &stripeClient{cfg: Config{WebhookSecret: testWebhookSecret}}
+	sessionID := "cs_test_mismatch_abc"
+	body, _ := json.Marshal(map[string]any{
+		"id":          "evt_test_mismatch",
+		"object":      "event",
+		"api_version": "2026-04-22.dahlia", // newer than the SDK's 2025-08-27.basil
+		"type":        string(EventCheckoutCompleted),
+		"data": map[string]any{
+			"object": map[string]any{
+				"id":     sessionID,
+				"object": "checkout.session",
+			},
+		},
+	})
+	header := signStripePayload(t, body, testWebhookSecret)
+
+	event, err := c.ConstructEvent(body, header)
+	require.NoError(t, err, "API version mismatch must not block event processing")
+	assert.Equal(t, string(EventCheckoutCompleted), event.Type)
+	require.NotNil(t, event.CheckoutSession)
+	assert.Equal(t, sessionID, event.CheckoutSession.ID)
+}

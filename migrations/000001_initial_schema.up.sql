@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS cards (
     fiat_currency VARCHAR(3) NOT NULL DEFAULT 'EUR', -- ISO 4217 settlement currency (always EUR for payouts)
     status card_status DEFAULT 'created' NOT NULL,
     payment_method TEXT NOT NULL DEFAULT 'card',     -- 'card' | 'bank_transfer'
-    payment_reference TEXT UNIQUE,                   -- Stripe session ID | SEPA reference
+    payment_reference TEXT,                   -- Stripe session ID | SEPA reference
     payment_status card_payment_status NOT NULL DEFAULT 'pending',  -- 'pending' | 'paid' | 'failed' | 'expired'
     payment_expires_at TIMESTAMPTZ,                  -- 24h payment window; NULL after payment confirmed
     stripe_checkout_url TEXT,                        -- Stripe hosted checkout URL (card payments only)
@@ -69,6 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_cards_code ON cards(code);
 CREATE INDEX IF NOT EXISTS idx_cards_user_id ON cards(user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_cards_purchase_email ON cards(purchase_email) WHERE purchase_email IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_cards_owner_email ON cards(owner_email) WHERE owner_email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cards_payment_reference ON cards(payment_reference) WHERE payment_reference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status);
 CREATE INDEX IF NOT EXISTS idx_cards_payment_status ON cards(payment_status);
 CREATE INDEX IF NOT EXISTS idx_cards_payment_expires_at ON cards(payment_expires_at) WHERE payment_expires_at IS NOT NULL;

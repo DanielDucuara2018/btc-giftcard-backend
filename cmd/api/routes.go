@@ -65,6 +65,7 @@ func (h *handler) registerNodeRoutes(mux *http.ServeMux) {
 
 func (h *handler) registerPaymentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /webhook/stripe", h.cardPayment)
+	mux.HandleFunc("GET /checkout/sessions/{session_id}", h.getCardsBySession)
 	// mux.HandleFunc("POST /webhook/qonto", h.bankTransferPayment)
 }
 

@@ -26,6 +26,7 @@ type mockCardService struct {
 	createCard                  func(context.Context, card.CreateCardRequest) (*card.CreateCardResponse, error)
 	redeemCard                  func(context.Context, card.RedeemCardRequest) (*card.RedeemCardResponse, error)
 	getCardByCode               func(context.Context, string) (*database.Card, error)
+	getCardsBySessionID         func(context.Context, string) (*card.SessionCardsResponse, error)
 	getCardBalance              func(context.Context, string) (int64, error)
 	validateCardCode            func(context.Context, string) (database.CardStatus, error)
 	getTreasuryAvailableBalance func(context.Context) (int64, error)
@@ -40,6 +41,9 @@ func (m *mockCardService) RedeemCard(ctx context.Context, req card.RedeemCardReq
 }
 func (m *mockCardService) GetCardByCode(ctx context.Context, code string) (*database.Card, error) {
 	return m.getCardByCode(ctx, code)
+}
+func (m *mockCardService) GetCardsBySessionID(ctx context.Context, sessionID string) (*card.SessionCardsResponse, error) {
+	return m.getCardsBySessionID(ctx, sessionID)
 }
 func (m *mockCardService) GetCardBalance(ctx context.Context, cardID string) (int64, error) {
 	return m.getCardBalance(ctx, cardID)
@@ -279,6 +283,95 @@ func TestGetCard_NotFound(t *testing.T) {
 	newTestHandler(svc).getCard(w, r)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// ============================================================================
+// getCardsBySession tests
+// ============================================================================
+
+func TestGetCardsBySession_Paid(t *testing.T) {
+	sessionID := "cs_test_paid_001"
+	svc := &mockCardService{
+		getCardsBySessionID: func(_ context.Context, id string) (*card.SessionCardsResponse, error) {
+			assert.Equal(t, sessionID, id)
+			return &card.SessionCardsResponse{
+				PaymentStatus: database.PaymentPaid,
+				Cards: []card.CreatedCard{
+					{CardID: "card-uuid-1", Code: "GIFT-TEST-AAAA-0001"},
+					{CardID: "card-uuid-2", Code: "GIFT-TEST-BBBB-0002"},
+				},
+			}, nil
+		},
+	}
+
+	r := httptest.NewRequest("GET", "/api/cards/session/"+sessionID, nil)
+	r.SetPathValue("session_id", sessionID)
+	w := httptest.NewRecorder()
+
+	newTestHandler(svc).getCardsBySession(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp card.SessionCardsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, database.PaymentPaid, resp.PaymentStatus)
+	assert.Len(t, resp.Cards, 2)
+	assert.Equal(t, "GIFT-TEST-AAAA-0001", resp.Cards[0].Code)
+}
+
+func TestGetCardsBySession_Pending(t *testing.T) {
+	sessionID := "cs_test_pending_001"
+	svc := &mockCardService{
+		getCardsBySessionID: func(_ context.Context, _ string) (*card.SessionCardsResponse, error) {
+			return &card.SessionCardsResponse{
+				PaymentStatus: database.PaymentPending,
+				Cards:         nil,
+			}, nil
+		},
+	}
+
+	r := httptest.NewRequest("GET", "/api/cards/session/"+sessionID, nil)
+	r.SetPathValue("session_id", sessionID)
+	w := httptest.NewRecorder()
+
+	newTestHandler(svc).getCardsBySession(w, r)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp card.SessionCardsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, database.PaymentPending, resp.PaymentStatus)
+	assert.Empty(t, resp.Cards)
+}
+
+func TestGetCardsBySession_NotFound(t *testing.T) {
+	svc := &mockCardService{
+		getCardsBySessionID: func(_ context.Context, _ string) (*card.SessionCardsResponse, error) {
+			return nil, card.ErrCardNotFound
+		},
+	}
+
+	r := httptest.NewRequest("GET", "/api/cards/session/cs_unknown", nil)
+	r.SetPathValue("session_id", "cs_unknown")
+	w := httptest.NewRecorder()
+
+	newTestHandler(svc).getCardsBySession(w, r)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestGetCardsBySession_ServiceError(t *testing.T) {
+	svc := &mockCardService{
+		getCardsBySessionID: func(_ context.Context, _ string) (*card.SessionCardsResponse, error) {
+			return nil, fmt.Errorf("db connection error")
+		},
+	}
+
+	r := httptest.NewRequest("GET", "/api/cards/session/cs_error", nil)
+	r.SetPathValue("session_id", "cs_error")
+	w := httptest.NewRecorder()
+
+	newTestHandler(svc).getCardsBySession(w, r)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // ============================================================================

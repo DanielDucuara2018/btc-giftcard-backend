@@ -209,6 +209,7 @@ func (r *CardRepository) GetByID(ctx context.Context, id string) (*Card, error) 
 	query := `SELECT 
         id, user_id, purchase_email, owner_email, code,
         btc_amount_sats, fiat_amount_cents, fiat_currency,
+        payment_method, payment_reference, payment_status, payment_expires_at,
         status, created_at, funded_at, redeemed_at
     FROM cards WHERE id = $1`
 
@@ -223,6 +224,10 @@ func (r *CardRepository) GetByID(ctx context.Context, id string) (*Card, error) 
 		&card.BTCAmountSats,
 		&card.FiatAmountCents,
 		&card.FiatCurrency,
+		&card.PaymentMethod,
+		&card.PaymentReference,
+		&card.PaymentStatus,
+		&card.PaymentExpiresAt,
 		&card.Status,
 		&card.CreatedAt,
 		&card.FundedAt,

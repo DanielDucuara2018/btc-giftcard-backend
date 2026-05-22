@@ -35,7 +35,8 @@ func TestCardRepository_Create(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          now,
 	}
@@ -69,7 +70,8 @@ func TestCardRepository_Create_DuplicateCode(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -86,7 +88,8 @@ func TestCardRepository_Create_DuplicateCode(t *testing.T) {
 		BTCAmountSats:      200000,
 		FiatAmountCents:    10000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 10300,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -126,7 +129,8 @@ func TestCardRepository_GetByID(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -159,7 +163,8 @@ func TestCardRepository_Update(t *testing.T) {
 		BTCAmountSats:      0,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -231,7 +236,8 @@ func TestCardRepository_ListByUserID(t *testing.T) {
 			BTCAmountSats:      100000,
 			FiatAmountCents:    5000,
 			FiatCurrency:       "USD",
-			PurchasePriceCents: 5150,
+			PaymentMethod:      CardBlue,
+			PaymentStatus:      PaymentPending,
 			Status:             Created,
 			CreatedAt:          time.Now().UTC().Add(-time.Duration(i) * time.Hour), // Different timestamps
 		}

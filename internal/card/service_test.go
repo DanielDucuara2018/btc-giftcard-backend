@@ -4,11 +4,13 @@ package card
 
 import (
 	"btc-giftcard/internal/database"
+	"btc-giftcard/internal/fees"
 	"btc-giftcard/internal/payment"
 	messages "btc-giftcard/internal/queue"
 	"btc-giftcard/pkg/logger"
 	streams "btc-giftcard/pkg/queue"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -24,37 +26,166 @@ func init() {
 	_ = logger.Init("development")
 }
 
-// setupTestService creates a test service instance with database and repositories
+// ============================================================================
+// Test helpers
+// ============================================================================
+
+// mockPaymentProvider satisfies payment.Provider for unit tests.
+type mockPaymentProvider struct{}
+
+func (m *mockPaymentProvider) CreateCheckoutSession(
+	_ context.Context,
+	_ payment.CreateCheckoutRequest,
+) (*payment.CheckoutSession, error) {
+	return &payment.CheckoutSession{
+		ID:        "cs_mock_" + uuid.New().String()[:8],
+		URL:       "https://checkout.stripe.com/mock",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}, nil
+}
+
+func (m *mockPaymentProvider) ConstructEvent([]byte, string) (*payment.Event, error) {
+	return nil, errors.New("not implemented")
+}
+
+// testFeesCfg returns a fees.Config with realistic non-zero values.
+func testFeesCfg() *fees.Config {
+	return &fees.Config{
+		ServiceFeePct:    2.0,
+		StripeFeePct:     1.4,
+		StripeFeeFlatEUR: 0.25,
+		CryptoSpreadPct:  0.5,
+		SEPAFeeEUR:       0.0,
+		PaymentExpiryH:   24,
+	}
+}
+
+// setupTestService creates a minimal service (no payment provider, no fees).
+// Use this for HandleCheckoutEvent tests and validation-only tests.
 func setupTestService(t *testing.T) (*Service, *database.DB, *database.CardRepository, *redis.Client) {
 	t.Helper()
 
 	db := database.SetupTestDB(t)
-
 	cardRepo := database.NewCardRepository(db)
 	txRepo := database.NewTransactionRepository(db)
 
-	// Setup Redis for queue
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
-		DB:   1, // Use DB 1 for tests to avoid conflicts
+		DB:   1,
 	})
 
-	// Clear test stream
 	ctx := context.Background()
 	redisClient.Del(ctx, "fund_card")
 
-	// Create queue
 	queue := streams.NewStreamQueue(redisClient)
 	err := queue.DeclareStream(ctx, "fund_card", "test_workers")
 	require.NoError(t, err)
 
 	service := NewService(db, cardRepo, txRepo, queue, nil, nil, nil)
-
 	return service, db, cardRepo, redisClient
 }
 
+// setupTestServiceFull creates a service with a mock payment provider and fees
+// config. Use this for CreateCard happy-path tests.
+func setupTestServiceFull(t *testing.T) (*Service, *database.DB, *database.CardRepository, *redis.Client) {
+	t.Helper()
+
+	db := database.SetupTestDB(t)
+	cardRepo := database.NewCardRepository(db)
+	txRepo := database.NewTransactionRepository(db)
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   1,
+	})
+
+	ctx := context.Background()
+	redisClient.Del(ctx, "fund_card")
+
+	queue := streams.NewStreamQueue(redisClient)
+	err := queue.DeclareStream(ctx, "fund_card", "test_workers")
+	require.NoError(t, err)
+
+	service := NewService(db, cardRepo, txRepo, queue, nil, &mockPaymentProvider{}, testFeesCfg())
+	return service, db, cardRepo, redisClient
+}
+
+// ============================================================================
+// CreateCard tests
+// ============================================================================
+
+// TestService_CreateCard_Validation exercises validateCreateRequest via table-
+// driven subtests. No payment provider is needed: validation returns before any
+// provider call.
+func TestService_CreateCard_Validation(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+
+	validBase := CreateCardRequest{
+		Items:         []CreateCardItem{{FiatAmountCents: 5000, Quantity: 1}},
+		FiatCurrency:  database.FiatEUR,
+		PaymentMethod: database.CardBlue,
+		PurchaseEmail: "test@example.com",
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*CreateCardRequest)
+		want   error
+	}{
+		{
+			name:   "empty items",
+			mutate: func(r *CreateCardRequest) { r.Items = nil },
+			want:   ErrEmptyItems,
+		},
+		{
+			name:   "zero amount",
+			mutate: func(r *CreateCardRequest) { r.Items = []CreateCardItem{{FiatAmountCents: 0, Quantity: 1}} },
+			want:   ErrInvalidFiatAmount,
+		},
+		{
+			name:   "negative amount",
+			mutate: func(r *CreateCardRequest) { r.Items = []CreateCardItem{{FiatAmountCents: -1, Quantity: 1}} },
+			want:   ErrInvalidFiatAmount,
+		},
+		{
+			name:   "zero quantity",
+			mutate: func(r *CreateCardRequest) { r.Items = []CreateCardItem{{FiatAmountCents: 5000, Quantity: 0}} },
+			want:   ErrInvalidQuantity,
+		},
+		{
+			name:   "unsupported currency",
+			mutate: func(r *CreateCardRequest) { r.FiatCurrency = "GBP" },
+			want:   ErrInvalidCurrency,
+		},
+		{
+			name:   "missing email",
+			mutate: func(r *CreateCardRequest) { r.PurchaseEmail = "" },
+			want:   ErrMissingEmail,
+		},
+		{
+			name:   "invalid payment method",
+			mutate: func(r *CreateCardRequest) { r.PaymentMethod = "cash" },
+			want:   ErrInvalidPaymentMethod,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := validBase
+			tc.mutate(&req)
+			_, err := service.CreateCard(ctx, req)
+			assert.ErrorIs(t, err, tc.want)
+		})
+	}
+}
+
 func TestService_CreateCard(t *testing.T) {
-	service, db, cardRepo, redisClient := setupTestService(t)
+	service, db, cardRepo, redisClient := setupTestServiceFull(t)
 	defer db.Close()
 	defer redisClient.Close()
 	defer database.CleanupTestDB(t, db)
@@ -64,60 +195,52 @@ func TestService_CreateCard(t *testing.T) {
 	email := "test@example.com"
 
 	req := CreateCardRequest{
-		FiatAmountCents:    10000, // $100
-		FiatCurrency:       "USD",
-		PurchasePriceCents: 10500, // $105 with fees
-		UserID:             &userID,
-		PurchaseEmail:      email,
+		Items:         []CreateCardItem{{FiatAmountCents: 10000, Quantity: 1}},
+		FiatCurrency:  database.FiatUSD,
+		PaymentMethod: database.CardBlue,
+		UserID:        &userID,
+		PurchaseEmail: email,
 	}
 
-	// Execute
 	resp, err := service.CreateCard(ctx, req)
 
-	// Assert
 	require.NoError(t, err)
-	assert.NotEmpty(t, resp.CardID)
-	assert.NotEmpty(t, resp.Code)
-	assert.Equal(t, int64(0), resp.BTCAmountSats) // 0 until funded by worker
-	assert.Equal(t, database.Created, resp.Status)
-	assert.WithinDuration(t, time.Now().UTC(), resp.CreatedAt, 2*time.Second)
+	require.Len(t, resp.Cards, 1)
+	assert.NotEmpty(t, resp.Cards[0].CardID)
+	assert.NotEmpty(t, resp.Cards[0].Code)
+	assert.NotEmpty(t, resp.CheckoutURL)
+	assert.NotEmpty(t, resp.SessionID)
 
 	// Verify code format: GIFT-XXXX-YYYY-ZZZZ
-	assert.Regexp(t, `^GIFT-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$`, resp.Code)
+	assert.Regexp(t, `^GIFT-[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$`, resp.Cards[0].Code)
 
 	// Verify card was saved in database
-	savedCard, err := cardRepo.GetByID(ctx, resp.CardID)
+	savedCard, err := cardRepo.GetByID(ctx, resp.Cards[0].CardID)
 	require.NoError(t, err)
-	assert.Equal(t, resp.Code, savedCard.Code)
+	assert.Equal(t, resp.Cards[0].Code, savedCard.Code)
 	assert.Equal(t, userID, *savedCard.UserID)
 	assert.Equal(t, email, savedCard.PurchaseEmail)
-	assert.Equal(t, email, savedCard.OwnerEmail) // Initially same as purchaser
-	assert.Equal(t, int64(0), savedCard.BTCAmountSats)
+	assert.Equal(t, email, savedCard.OwnerEmail)
+	assert.Equal(t, int64(0), savedCard.BTCAmountSats) // 0 until funded by worker
+	assert.Equal(t, int64(10000), savedCard.FiatAmountCents)
+	assert.Equal(t, database.FiatUSD, savedCard.FiatCurrency)
+	assert.Equal(t, database.CardBlue, savedCard.PaymentMethod)
+	assert.Equal(t, database.PaymentPending, savedCard.PaymentStatus)
+	assert.NotNil(t, savedCard.PaymentReference)
+	assert.Equal(t, resp.SessionID, *savedCard.PaymentReference)
+	assert.Equal(t, database.Created, savedCard.Status)
+	assert.WithinDuration(t, time.Now().UTC(), savedCard.CreatedAt, 2*time.Second)
 	assert.Nil(t, savedCard.FundedAt)
 	assert.Nil(t, savedCard.RedeemedAt)
 
-	// Verify message was published to queue
-	time.Sleep(100 * time.Millisecond) // Give Redis time to process
-
-	result, err := redisClient.XRead(ctx, &redis.XReadArgs{
-		Streams: []string{"fund_card", "0"},
-		Count:   1,
-	}).Result()
-	require.NoError(t, err)
-	require.Len(t, result, 1)
-	require.Len(t, result[0].Messages, 1)
-
-	// Verify message content
-	msgData := result[0].Messages[0].Values["data"].(string)
-	msg, err := messages.FromJSONFundCard([]byte(msgData))
-	require.NoError(t, err)
-	assert.Equal(t, resp.CardID, msg.CardID)
-	assert.Equal(t, int64(10000), msg.FiatAmountCents)
-	assert.Equal(t, "USD", msg.FiatCurrency)
+	// CreateCard does NOT publish fund_card messages. That happens in
+	// HandleCheckoutEvent after Stripe confirms payment. The queue must be empty.
+	result := redisClient.XLen(ctx, "fund_card")
+	assert.Equal(t, int64(0), result.Val())
 }
 
 func TestService_CreateCard_WithoutOptionalFields(t *testing.T) {
-	service, db, cardRepo, redisClient := setupTestService(t)
+	service, db, cardRepo, redisClient := setupTestServiceFull(t)
 	defer db.Close()
 	defer redisClient.Close()
 	defer database.CleanupTestDB(t, db)
@@ -125,125 +248,114 @@ func TestService_CreateCard_WithoutOptionalFields(t *testing.T) {
 	ctx := context.Background()
 
 	req := CreateCardRequest{
-		FiatAmountCents:    5000,
-		FiatCurrency:       "EUR",
-		PurchasePriceCents: 5200,
-		PurchaseEmail:      "anonymous@example.com",
-		UserID:             nil, // No user ID
+		Items:         []CreateCardItem{{FiatAmountCents: 5000, Quantity: 1}},
+		FiatCurrency:  database.FiatEUR,
+		PaymentMethod: database.CardBlue,
+		PurchaseEmail: "anonymous@example.com",
+		UserID:        nil, // No user ID
 	}
 
-	// Execute
 	resp, err := service.CreateCard(ctx, req)
-
-	// Assert
 	require.NoError(t, err)
-	assert.NotEmpty(t, resp.CardID)
-	assert.NotEmpty(t, resp.Code)
+	require.Len(t, resp.Cards, 1)
 
-	// Verify in database
-	savedCard, err := cardRepo.GetByID(ctx, resp.CardID)
+	savedCard, err := cardRepo.GetByID(ctx, resp.Cards[0].CardID)
 	require.NoError(t, err)
 	assert.Nil(t, savedCard.UserID)
 	assert.Equal(t, "anonymous@example.com", savedCard.PurchaseEmail)
 	assert.Equal(t, "anonymous@example.com", savedCard.OwnerEmail)
-	assert.Equal(t, "EUR", savedCard.FiatCurrency)
+	assert.Equal(t, database.FiatEUR, savedCard.FiatCurrency)
 }
 
 func TestService_CreateCard_GeneratesUniqueCode(t *testing.T) {
-	service, db, _, redisClient := setupTestService(t)
+	service, db, _, redisClient := setupTestServiceFull(t)
 	defer db.Close()
 	defer redisClient.Close()
 	defer database.CleanupTestDB(t, db)
 
 	ctx := context.Background()
 
-	// Create multiple cards
 	codes := make(map[string]bool)
 	for i := 0; i < 10; i++ {
 		req := CreateCardRequest{
-			FiatAmountCents:    10000,
-			FiatCurrency:       "USD",
-			PurchasePriceCents: 10500,
-			PurchaseEmail:      "test@example.com",
+			Items:         []CreateCardItem{{FiatAmountCents: 10000, Quantity: 1}},
+			FiatCurrency:  database.FiatUSD,
+			PaymentMethod: database.CardBlue,
+			PurchaseEmail: "test@example.com",
 		}
 
 		resp, err := service.CreateCard(ctx, req)
 		require.NoError(t, err)
+		require.Len(t, resp.Cards, 1)
 
-		// Verify code is unique
-		assert.False(t, codes[resp.Code], "Duplicate code generated: %s", resp.Code)
-		codes[resp.Code] = true
+		assert.False(t, codes[resp.Cards[0].Code], "Duplicate code: %s", resp.Cards[0].Code)
+		codes[resp.Cards[0].Code] = true
 	}
 
-	assert.Equal(t, 10, len(codes), "Should generate 10 unique codes")
+	assert.Equal(t, 10, len(codes))
 }
 
-func TestService_CreateCard_AllFieldsPopulated(t *testing.T) {
-	service, db, cardRepo, redisClient := setupTestService(t)
+// TestService_CreateCard_BulkOrder verifies that a multi-item order creates the
+// correct total number of cards and that all of them share one payment_reference.
+// This test would previously fail due to the (now-removed) UNIQUE constraint on
+// payment_reference.
+func TestService_CreateCard_BulkOrder(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestServiceFull(t)
 	defer db.Close()
 	defer redisClient.Close()
 	defer database.CleanupTestDB(t, db)
 
 	ctx := context.Background()
 	userID := uuid.New().String()
-	email := "buyer@test.com"
 
 	req := CreateCardRequest{
-		FiatAmountCents:    25000,
-		FiatCurrency:       "GBP",
-		PurchasePriceCents: 26000,
-		UserID:             &userID,
-		PurchaseEmail:      email,
+		Items: []CreateCardItem{
+			{FiatAmountCents: 5000, Quantity: 2},
+			{FiatAmountCents: 10000, Quantity: 1},
+		},
+		FiatCurrency:  database.FiatEUR,
+		PaymentMethod: database.CardBlue,
+		UserID:        &userID,
+		PurchaseEmail: "buyer@test.com",
 	}
 
-	// Execute
 	resp, err := service.CreateCard(ctx, req)
 	require.NoError(t, err)
+	assert.Len(t, resp.Cards, 3) // 2 × €50 + 1 × €100
 
-	// Verify all fields in database
-	savedCard, err := cardRepo.GetByID(ctx, resp.CardID)
-	require.NoError(t, err)
-
-	assert.Equal(t, resp.CardID, savedCard.ID)
-	assert.Equal(t, userID, *savedCard.UserID)
-	assert.Equal(t, email, savedCard.PurchaseEmail)
-	assert.Equal(t, email, savedCard.OwnerEmail) // Initially same as purchaser
-	assert.Equal(t, resp.Code, savedCard.Code)
-	assert.Equal(t, int64(0), savedCard.BTCAmountSats) // 0 until funded by worker
-	assert.Equal(t, int64(25000), savedCard.FiatAmountCents)
-	assert.Equal(t, "GBP", savedCard.FiatCurrency)
-	assert.Equal(t, int64(26000), savedCard.PurchasePriceCents)
-	assert.Equal(t, database.Created, savedCard.Status)
-	assert.WithinDuration(t, time.Now().UTC(), savedCard.CreatedAt, 2*time.Second)
-	assert.Nil(t, savedCard.FundedAt)
-	assert.Nil(t, savedCard.RedeemedAt)
+	// All cards share the same payment_reference (Stripe session ID).
+	for _, c := range resp.Cards {
+		saved, err := cardRepo.GetByID(ctx, c.CardID)
+		require.NoError(t, err)
+		require.NotNil(t, saved.PaymentReference)
+		assert.Equal(t, resp.SessionID, *saved.PaymentReference)
+	}
 }
 
 func TestService_CreateCard_CodeExcludesConfusingCharacters(t *testing.T) {
-	service, db, _, redisClient := setupTestService(t)
+	service, db, _, redisClient := setupTestServiceFull(t)
 	defer db.Close()
 	defer redisClient.Close()
 	defer database.CleanupTestDB(t, db)
 
 	ctx := context.Background()
 
-	// Create multiple cards and verify no confusing characters
 	confusingChars := []string{"O", "0", "I", "1", "L"}
 
 	for i := 0; i < 20; i++ {
 		req := CreateCardRequest{
-			FiatAmountCents:    10000,
-			FiatCurrency:       "USD",
-			PurchasePriceCents: 10500,
-			PurchaseEmail:      "test@example.com",
+			Items:         []CreateCardItem{{FiatAmountCents: 10000, Quantity: 1}},
+			FiatCurrency:  database.FiatUSD,
+			PaymentMethod: database.CardBlue,
+			PurchaseEmail: "test@example.com",
 		}
 
 		resp, err := service.CreateCard(ctx, req)
 		require.NoError(t, err)
+		require.Len(t, resp.Cards, 1)
 
-		// Check code doesn't contain confusing characters
 		for _, char := range confusingChars {
-			assert.NotContains(t, strings.TrimPrefix(resp.Code, "GIFT-"), char,
+			assert.NotContains(t, strings.TrimPrefix(resp.Cards[0].Code, "GIFT-"), char,
 				"Code should not contain confusing character: %s", char)
 		}
 	}
@@ -257,18 +369,18 @@ func TestService_generateCardCode_RetriesOnDuplicate(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create a card with a specific code
 	existingCard := &database.Card{
-		ID:                 uuid.New().String(),
-		PurchaseEmail:      "test@example.com",
-		OwnerEmail:         "test@example.com",
-		Code:               "GIFT-TEST-CODE-0001",
-		BTCAmountSats:      100000,
-		FiatAmountCents:    1000,
-		FiatCurrency:       "USD",
-		PurchasePriceCents: 1050,
-		Status:             database.Created,
-		CreatedAt:          time.Now().UTC(),
+		ID:              uuid.New().String(),
+		PurchaseEmail:   "test@example.com",
+		OwnerEmail:      "test@example.com",
+		Code:            "GIFT-TEST-CODE-0001",
+		BTCAmountSats:   100000,
+		FiatAmountCents: 1000,
+		FiatCurrency:    database.FiatUSD,
+		PaymentMethod:   database.CardBlue,
+		PaymentStatus:   database.PaymentPending,
+		Status:          database.Created,
+		CreatedAt:       time.Now().UTC(),
 	}
 
 	err := cardRepo.Create(ctx, existingCard)
@@ -295,18 +407,18 @@ func TestService_generateCardCode_RetriesOnDuplicate(t *testing.T) {
 func testCard(sessionID string, code string) *database.Card {
 	ref := sessionID
 	return &database.Card{
-		ID:                 uuid.New().String(),
-		PurchaseEmail:      "buyer@test.com",
-		OwnerEmail:         "buyer@test.com",
-		Code:               code,
-		BTCAmountSats:      0,
-		FiatAmountCents:    5000,
-		FiatCurrency:       "EUR",
-		PurchasePriceCents: 5200,
-		PaymentReference:   &ref,
-		PaymentStatus:      database.PaymentPending,
-		Status:             database.Created,
-		CreatedAt:          time.Now().UTC(),
+		ID:               uuid.New().String(),
+		PurchaseEmail:    "buyer@test.com",
+		OwnerEmail:       "buyer@test.com",
+		Code:             code,
+		BTCAmountSats:    0,
+		FiatAmountCents:  5000,
+		FiatCurrency:     database.FiatEUR,
+		PaymentMethod:    database.CardBlue,
+		PaymentReference: &ref,
+		PaymentStatus:    database.PaymentPending,
+		Status:           database.Created,
+		CreatedAt:        time.Now().UTC(),
 	}
 }
 
@@ -464,3 +576,65 @@ func TestHandleCheckoutEvent_Expired_EmptyCards(t *testing.T) {
 // any of the helper imports above.
 var _ = messages.FundCardMessage{}
 var _ = streams.NewStreamQueue
+
+// ============================================================================
+// GetCardsBySessionID tests
+// ============================================================================
+
+// TestGetCardsBySessionID_Paid verifies that codes are returned when
+// payment_status is "paid".
+func TestGetCardsBySessionID_Paid(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+	sessionID := "cs_test_paid_" + uuid.New().String()[:8]
+
+	c1 := testCard(sessionID, "GIFT-GBSI-P001-AAAA")
+	c2 := testCard(sessionID, "GIFT-GBSI-P002-BBBB")
+	require.NoError(t, cardRepo.Create(ctx, c1))
+	require.NoError(t, cardRepo.Create(ctx, c2))
+	require.NoError(t, cardRepo.UpdatePaymentStatus(ctx, sessionID, database.PaymentPaid))
+
+	resp, err := service.GetCardsBySessionID(ctx, sessionID)
+	require.NoError(t, err)
+	assert.Equal(t, database.PaymentPaid, resp.PaymentStatus)
+	require.Len(t, resp.Cards, 2)
+	codes := []string{resp.Cards[0].Code, resp.Cards[1].Code}
+	assert.Contains(t, codes, "GIFT-GBSI-P001-AAAA")
+	assert.Contains(t, codes, "GIFT-GBSI-P002-BBBB")
+}
+
+// TestGetCardsBySessionID_Pending verifies that no codes are exposed when
+// payment_status is still "pending".
+func TestGetCardsBySessionID_Pending(t *testing.T) {
+	service, db, cardRepo, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	ctx := context.Background()
+	sessionID := "cs_test_pending_" + uuid.New().String()[:8]
+
+	c := testCard(sessionID, "GIFT-GBSI-PN01-CCCC")
+	require.NoError(t, cardRepo.Create(ctx, c))
+
+	resp, err := service.GetCardsBySessionID(ctx, sessionID)
+	require.NoError(t, err)
+	assert.Equal(t, database.PaymentPending, resp.PaymentStatus)
+	assert.Empty(t, resp.Cards, "codes must not be exposed before payment is confirmed")
+}
+
+// TestGetCardsBySessionID_NotFound verifies that ErrCardNotFound is returned
+// when the session has no associated cards.
+func TestGetCardsBySessionID_NotFound(t *testing.T) {
+	service, db, _, redisClient := setupTestService(t)
+	defer db.Close()
+	defer redisClient.Close()
+	defer database.CleanupTestDB(t, db)
+
+	_, err := service.GetCardsBySessionID(context.Background(), "cs_nonexistent_session")
+	assert.ErrorIs(t, err, ErrCardNotFound)
+}

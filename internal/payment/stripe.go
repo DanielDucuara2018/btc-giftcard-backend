@@ -50,11 +50,12 @@ func (c *stripeClient) CreateCheckoutSession(ctx context.Context, req CreateChec
 	}
 
 	params := &stripe.CheckoutSessionParams{
-		LineItems:  lineItems,
-		Mode:       stripe.String(string(stripe.CheckoutSessionModePayment)),
-		SuccessURL: stripe.String(c.cfg.SuccessURL),
-		CancelURL:  stripe.String(c.cfg.CancelURL),
-		ExpiresAt:  stripe.Int64(expiresAt.Unix()),
+		LineItems:     lineItems,
+		Mode:          stripe.String(string(stripe.CheckoutSessionModePayment)),
+		SuccessURL:    stripe.String(c.cfg.SuccessURL),
+		CancelURL:     stripe.String(c.cfg.CancelURL),
+		ExpiresAt:     stripe.Int64(expiresAt.Unix()),
+		CustomerEmail: stripe.String(req.PurchaseEmail),
 		Metadata: map[string]string{
 			"purchase_email": req.PurchaseEmail,
 		},
@@ -74,7 +75,17 @@ func (c *stripeClient) CreateCheckoutSession(ctx context.Context, req CreateChec
 }
 
 func (c *stripeClient) ConstructEvent(rawBody []byte, sigHeader string) (*Event, error) {
-	stripeEvent, err := webhook.ConstructEvent(rawBody, sigHeader, c.cfg.WebhookSecret)
+	// IgnoreAPIVersionMismatch: the stripe-go v82 SDK targets API version
+	// 2025-08-27.basil, but the Stripe CLI forwards events at the account's
+	// current API version (e.g. 2026-04-22.dahlia). We safely ignore this
+	// mismatch because we only read session.ID from the deserialized payload —
+	// a stable primitive field that has not changed across API versions.
+	// In production, configure the webhook endpoint in the Stripe dashboard to
+	// pin it to 2025-08-27.basil once a matching stable SDK is available.
+	stripeEvent, err := webhook.ConstructEventWithOptions(
+		rawBody, sigHeader, c.cfg.WebhookSecret,
+		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true},
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ DROP INDEX IF EXISTS idx_transactions_card_id;
 DROP INDEX IF EXISTS idx_cards_created_at;
 DROP INDEX IF EXISTS idx_cards_payment_expires_at;
 DROP INDEX IF EXISTS idx_cards_payment_status;
+DROP INDEX IF EXISTS idx_cards_payment_reference;
 DROP INDEX IF EXISTS idx_cards_status;
 DROP INDEX IF EXISTS idx_cards_purchase_email;
 DROP INDEX IF EXISTS idx_cards_owner_email;

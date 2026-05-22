@@ -19,6 +19,7 @@ type cardServicer interface {
 	CreateCard(ctx context.Context, req card.CreateCardRequest) (*card.CreateCardResponse, error)
 	RedeemCard(ctx context.Context, req card.RedeemCardRequest) (*card.RedeemCardResponse, error)
 	GetCardByCode(ctx context.Context, code string) (*database.Card, error)
+	GetCardsBySessionID(ctx context.Context, sessionID string) (*card.SessionCardsResponse, error)
 	GetCardBalance(ctx context.Context, cardID string) (int64, error)
 	ValidateCardCode(ctx context.Context, code string) (database.CardStatus, error)
 	GetTreasuryAvailableBalance(ctx context.Context) (int64, error)
@@ -124,6 +125,25 @@ func (h *handler) redeemCard(w http.ResponseWriter, r *http.Request) {
 //	}
 func (h *handler) getCard(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.cardService.GetCardByCode(r.Context(), r.PathValue("code"))
+	if handleError(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// getCardsBySession handles GET /api/checkout/sessions/{session_id}
+//
+// Returns payment status and card codes for a Stripe checkout session.
+// Card codes are only included once payment_status is "paid".
+//
+// Response 200:
+//
+//	{
+//	  "payment_status": "paid",
+//	  "cards": [{"card_id": "uuid", "code": "GIFT-XXXX-YYYY-ZZZZ"}]
+//	}
+func (h *handler) getCardsBySession(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.cardService.GetCardsBySessionID(r.Context(), r.PathValue("session_id"))
 	if handleError(w, err) {
 		return
 	}

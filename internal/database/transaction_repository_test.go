@@ -37,7 +37,8 @@ func TestTransactionRepository_Create(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -97,7 +98,8 @@ func TestTransactionRepository_Create_WithTxHash(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -183,7 +185,8 @@ func TestTransactionRepository_ListByCardID(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -258,7 +261,8 @@ func TestTransactionRepository_Update(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -344,7 +348,8 @@ func TestTransactionRepository_MultipleTypes(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -353,7 +358,7 @@ func TestTransactionRepository_MultipleTypes(t *testing.T) {
 
 	// Create transactions of different types
 	toAddr := "tb1qtestaddr"
-	types := []Type{Fund, Redeem, Payment}
+	types := []TransactionType{Fund, Redeem, Payment}
 	for _, txType := range types {
 		tx := &Transaction{
 			ID:            uuid.New().String(),
@@ -379,7 +384,7 @@ func TestTransactionRepository_MultipleTypes(t *testing.T) {
 	assert.Len(t, transactions, 3)
 
 	// Check that each type exists
-	foundTypes := make(map[Type]bool)
+	foundTypes := make(map[TransactionType]bool)
 	for _, tx := range transactions {
 		foundTypes[tx.Type] = true
 	}
@@ -407,7 +412,8 @@ func TestTransactionRepository_MultipleStatuses(t *testing.T) {
 		BTCAmountSats:      100000,
 		FiatAmountCents:    5000,
 		FiatCurrency:       "USD",
-		PurchasePriceCents: 5150,
+		PaymentMethod:      CardBlue,
+		PaymentStatus:      PaymentPending,
 		Status:             Created,
 		CreatedAt:          time.Now().UTC(),
 	}

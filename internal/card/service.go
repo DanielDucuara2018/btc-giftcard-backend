@@ -408,6 +408,33 @@ func (s *Service) GetCardByCode(ctx context.Context, code string) (*database.Car
 	return card, nil
 }
 
+// SessionCardsResponse is returned by GetCardsBySessionID.
+type SessionCardsResponse struct {
+	PaymentStatus database.CardPaymentStatus `json:"payment_status"`
+	Cards         []CreatedCard              `json:"cards"`
+}
+
+// GetCardsBySessionID returns the cards associated with a Stripe checkout session.
+// Card codes are only included when payment_status is "paid".
+func (s *Service) GetCardsBySessionID(ctx context.Context, sessionID string) (*SessionCardsResponse, error) {
+	cards, err := s.cardRepo.GetByStripeSessionID(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cards for session: %w", err)
+	}
+	if len(cards) == 0 {
+		return nil, ErrCardNotFound
+	}
+
+	status := cards[0].PaymentStatus
+	resp := &SessionCardsResponse{PaymentStatus: status}
+	if status == database.PaymentPaid {
+		for _, c := range cards {
+			resp.Cards = append(resp.Cards, CreatedCard{CardID: c.ID, Code: c.Code})
+		}
+	}
+	return resp, nil
+}
+
 // GetCardBalance returns the remaining balance (in satoshis) for a card.
 // In the custodial model, this is simply the btc_amount_sats field in the database.
 func (s *Service) GetCardBalance(ctx context.Context, cardID string) (int64, error) {
