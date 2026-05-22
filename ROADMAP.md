@@ -1653,6 +1653,136 @@ Example:
 
 ---
 
+## Phase 6: Merchant Discovery — "Where to Spend Your BTC" (Month 8-10)
+
+**Goal:** Help users understand where they can spend the BTC received from their gift card, while
+keeping the experience lightweight and not requiring a full marketplace build.
+
+---
+
+### Background & Problem Statement
+
+After a user redeems a gift card they hold BTC in their Lightning wallet. The natural next question is
+**"where can I spend it?"** Without guidance, many users will simply hold the BTC — missing the
+Lightning Network's core value proposition. A discovery layer bridges this gap.
+
+---
+
+### Option A: Custom Marketplace Directory
+
+Build an internal database of curated merchants (online + physical) that accept BTC/Lightning.
+
+| Aspect | Assessment |
+|--------|-----------|
+| Data freshness | Manual curation — becomes stale without ongoing effort |
+| Development cost | HIGH — admin panel, merchant onboarding flow, review process |
+| Initial coverage | Very limited (only what we manually add) |
+| Brand control | Full — fully customised UX |
+| Maintenance burden | High — we own the data quality problem |
+
+**Verdict:** Not recommended as a standalone solution for an early-stage product. Too much
+operational overhead for unproven demand. Consider as an optional overlay later.
+
+---
+
+### Option B: BTCMap Integration (Recommended Base Layer)
+
+**BTCMap** (`btcmap.org`) is the leading open-source, community-maintained global map of
+Bitcoin/Lightning-accepting merchants. Key facts:
+
+- **Data source:** OpenStreetMap tags + community contributions
+- **Coverage:** 10,000+ verified locations worldwide, strong EU coverage
+- **Lightning filter:** supports filtering to Lightning-only merchants
+- **License:** Open data, free to embed or query
+- **API:** REST JSON at `api.btcmap.org/v2/elements` (GeoJSON-compatible)
+- **Embed:** iframe widget available at `btcmap.org/map` with URL params for center/zoom
+
+#### Integration approaches
+
+| Approach | Effort | UX quality | Data ownership |
+|----------|--------|------------|----------------|
+| **iframe embed** (`btcmap.org/map?lat=...`) | 1-2 hours | Good — full BTCMap UI | None (external) |
+| **API + custom map** (MapLibre/Leaflet + OpenFreeMap tiles) | 3-5 days | Excellent — fully branded | None (data from API) |
+| **Hybrid** (API + curated featured merchants overlay) | 5-7 days | Best | Partial |
+
+#### BTCMap API example (fetch Lightning merchants near Paris)
+
+```
+GET https://api.btcmap.org/v2/elements?limit=100
+→ Filter client-side: tags["payment:lightning"] == "yes" && tags["payment:onchain"] != "no"
+```
+
+Each element contains: `id`, `osm_type`, `lat`, `lon`, `tags` (name, address, opening hours,
+payment methods, website, phone), `updated_at`.
+
+---
+
+### Option C: Hybrid Approach (Recommended)
+
+Combine BTCMap as the data backbone with a light Gifter curation layer:
+
+```
+[ BTCMap API ]  ──→  [ Frontend map ]  ──→  [ User ]
+                            ↑
+               [ Gifter "Featured Merchants" ]
+               (small curated list, manually maintained)
+```
+
+**User experience:**
+1. After redemption (SuccessPage) — banner: *"Ready to spend? Find merchants near you →"*
+2. Dedicated `/spend` page with a full-screen interactive map
+3. Map shows all BTCMap Lightning merchants + highlighted "Gifter Picks"
+4. Filter: All / Online / Physical / Restaurants / Shops
+5. Click merchant → side panel with name, address, payment methods, directions link
+
+---
+
+### Technical Feasibility
+
+**Stack:**
+- `leaflet` + `react-leaflet` (lightweight, MIT, no API key needed) — ~140 KB gzipped
+- OpenStreetMap tiles (free, no key) or Stadia Maps free tier
+- BTCMap REST API (no auth required for read)
+- Optional: small backend endpoint for Gifter-curated featured merchants
+
+**Estimated effort:**
+- iframe embed only: **2-4 hours** — quick win, ship immediately
+- Full custom map with API: **3-5 days** — production-quality, branded
+- Hybrid with curated overlay: **5-7 days** — full feature
+
+**Dependencies:** None on the backend. Pure frontend feature.
+
+---
+
+### Decision: Phased Rollout
+
+| Phase | Deliverable | Effort |
+|-------|------------|--------|
+| **6.0 — Quick win** | Embed `btcmap.org/map` in an iframe on `/spend` page + link from SuccessPage | 2-4 h |
+| **6.1 — Custom map** | Replace iframe with Leaflet + BTCMap API, branded Gifter UI | 3-5 d |
+| **6.2 — Curated layer** | Add "Gifter Picks" overlay (20-50 hand-picked merchants) | 2-3 d |
+| **6.3 — Deep linking** | Gift card QR code scans open pre-filtered map near merchant | 1-2 d |
+
+Start with **Phase 6.0** immediately after SuccessPage is polished — zero backend work,
+zero maintenance, instant value for users.
+
+---
+
+### Implementation tasks
+
+- [ ] **6.0** Add `/spend` route and page in React Router
+- [ ] **6.0** Embed `https://btcmap.org/map` iframe (Lightning filter enabled by default)
+- [ ] **6.0** Add "Find merchants near you" CTA on SuccessPage after successful redemption
+- [ ] **6.1** Install `leaflet`, `react-leaflet` — build custom `MerchantMapPage`
+- [ ] **6.1** Fetch BTCMap elements API, filter `payment:lightning == yes`
+- [ ] **6.1** Custom marker icons distinguishing Lightning-only vs BTC+Lightning merchants
+- [ ] **6.1** Merchant side-panel: name, address, hours, payment icons, Google Maps link
+- [ ] **6.2** Add `GET /featured-merchants` backend endpoint returning curated JSON list
+- [ ] **6.2** Render featured merchants with a distinct "Gifter Picks ⭐" badge on the map
+- [ ] **6.3** Encode location hint in gift card QR code metadata → deep-link to map
+
+---
+
 ## Notes
 
 - This roadmap is subject to change based on user feedback and market conditions

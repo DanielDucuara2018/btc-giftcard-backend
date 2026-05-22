@@ -90,11 +90,11 @@ func run() error {
 		SuccessURL:    Cfg.StripeSuccessURL(),
 		CancelURL:     Cfg.StripeCancelURL(),
 	})
-	var feesCfg *fees.Config
+	var feesCfg fees.Config
 	if err := copier.Copy(&feesCfg, &Cfg.Fees); err != nil {
 		return fmt.Errorf("failed to copy fees config: %w", err)
 	}
-	cardService := card.NewService(db, cardRepo, txRepo, queue, lndClient, stripeProvider, feesCfg)
+	cardService := card.NewService(db, cardRepo, txRepo, queue, lndClient, stripeProvider, &feesCfg)
 
 	srv := newServer(cardService, lndClient, stripeProvider)
 
